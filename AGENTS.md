@@ -111,9 +111,9 @@ Rules:
   A command that is not in `g help` does not exist. Give each command its own
   `COMMAND --help`.
 - **All output goes through the presentation layer.** Use `section`, `kv`,
-  `muted`, `paint`, `table_begin`/`table_add`/`table_add_styled`/`table_flush`,
-  and `ok`/`warn`/`err`/`info`/`die`/`ask_yes_no`. Never hard-code an escape
-  sequence inside a sub-command.
+  `muted`, `detail`, `paint`, `table_begin`/`table_add`/`table_add_styled`/
+  `table_flush`, and `ok`/`warn`/`err`/`info`/`die`/`ask_yes_no`. Never
+  hard-code an escape sequence inside a sub-command.
 - **Two style sets.** `C_*` decorate stdout and `E_*` decorate stderr; the
   colour decision is made per stream. Report helpers (`section`, `kv`, `muted`,
   tables) write to stdout and use `C_*`; status lines and prompts write to
@@ -135,6 +135,17 @@ Rules:
   codes of the original script in `~/bitbucket/pftylr/utils/git`; record any
   intentional deviation in the commit body and in the command's help. Known
   deviation: `worktree -c/--check` is `g wt -s/--status`.
+- **Separate blocks, end with a blank line.** Human-facing output leaves a
+  blank line between the result and the hints that follow it, between a prompt
+  and whatever comes next, and at the very end. A blank line that only exists
+  for the terminal goes to stderr, so it never lands in a captured value:
+  `_wt_create` prints the separator on stderr and the path alone on stdout,
+  which keeps `cd "$(g wt branch)"` exact.
+- **Indent what is subordinate.** Lines that explain or elaborate on the line
+  above are indented: `detail` for prose, `relay` for output piped from git.
+  When a failure is reported under a message the command already printed, raise
+  `G_INDENT` for the block so the whole explanation — including its `error:`
+  line — sits one level in, and restore it afterwards.
 - **Confirm before destroying.** Destructive commands prompt for confirmation
   and never act on "all matches" silently.
 - **No new dependencies** unless a task cannot be done well without one. Bash,

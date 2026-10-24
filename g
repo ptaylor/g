@@ -25,6 +25,10 @@ G_VERSION="0.1.0"
 G_COLOR=0
 G_COLOR_ERR=0
 G_UNICODE=0
+# Indent applied by the status and detail helpers. Empty at top level; a
+# command that explains a failure under its own message raises it while it
+# prints the explanation, so the block reads as subordinate.
+G_INDENT=''
 C_RESET='' C_BOLD='' C_DIM='' C_ITALIC='' C_UNDERLINE='' C_REVERSE=''
 C_BLACK='' C_RED='' C_GREEN='' C_YELLOW=''
 C_BLUE='' C_MAGENTA='' C_CYAN='' C_WHITE=''
@@ -149,6 +153,22 @@ muted() {
   printf '%s%s%s\n' "$C_DIM" "$*" "$C_RESET"
 }
 
+# detail TEXT... — an indented continuation line on stderr, for the second and
+# later lines of a message that needs more than one. Nests under G_INDENT.
+detail() {
+  printf '%s  %s%s%s\n' "$G_INDENT" "$E_DIM" "$*" "$E_RESET" >&2
+}
+
+# relay — copy stdin to stderr, indented, for output that comes from git.
+# git's own chatter then reads as a detail of the message above it instead of
+# as another message from g.
+relay() {
+  local line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    printf '%s  %s\n' "$G_INDENT" "$line" >&2
+  done
+}
+
 # Status lines. In colour mode the glyph carries the meaning as well as the
 # colour, so the output still reads correctly for colour-blind users.
 _status() {
@@ -160,9 +180,9 @@ _status() {
     if (( G_UNICODE )); then
       glyph="$glyph_utf"
     fi
-    printf '%s%s%s %s\n' "$colour" "$glyph" "$E_RESET" "$*" >&2
+    printf '%s%s%s%s %s\n' "$G_INDENT" "$colour" "$glyph" "$E_RESET" "$*" >&2
   else
-    printf '%s%s\n' "$label" "$*" >&2
+    printf '%s%s%s\n' "$G_INDENT" "$label" "$*" >&2
   fi
 }
 
@@ -170,11 +190,20 @@ ok()   { _status "$E_GREEN"  "✓" "+" "ok: "      "$@"; }
 warn() { _status "$E_YELLOW" "!" "!" "warning: " "$@"; }
 err()  { _status "$E_RED"    "✗" "x" "error: "   "$@"; }
 info() { _status "$E_CYAN"   "•" "-" "note: "    "$@"; }
-die()  { err "$@"; exit 1; }
+
+# die TEXT — report a fatal error and leave the terminal on a blank line.
+die() {
+  err "$@"
+  printf '\n' >&2
+  exit 1
+}
 
 # ask_yes_no PROMPT — a y/N question on the terminal; true means yes.
 ask_yes_no() {
   local reply=''
+  if ! have_tty; then
+    return 1
+  fi
   printf '%s?%s %s [y/N] ' "$E_YELLOW" "$E_RESET" "$*" >&2
   if ! IFS= read -r reply < /dev/tty; then
     printf '\n' >&2
@@ -293,6 +322,14 @@ require_repo() {
   fi
 }
 
+# True when a controlling terminal can be opened for a prompt. Opening the
+# device is the only reliable test: /dev/tty exists and looks readable even
+# when there is no terminal behind it, and the failed open would print bash's
+# own "Device not configured" error.
+have_tty() {
+  { : </dev/tty; } 2>/dev/null
+}
+
 # ── g worktree ──────────────────────────────────────────────────────────────
 # Ported from ~/bitbucket/pftylr/utils/git/worktree.
 #
@@ -309,6 +346,8 @@ WT_BASE_REFS=()
 WT_PATHS=()
 WT_BRANCHES=()
 WT_PRUNABLE=()
+WT_LOCKED=()
+WT_LOCK_REASON=()
 WT_LOCAL_MATCHES=()
 WT_REMOTE_MATCHES=()
 WT_REMOTE_TRUNCATED=0
@@ -412,36 +451,58 @@ _wt_usable_for_branch() {
 }
 
 # Parse `git worktree list --porcelain` into WT_PATHS / WT_BRANCHES /
-# WT_PRUNABLE, one entry per worktree in the order git reports them.
+# WT_PRUNABLE / WT_LOCKED (+ WT_LOCK_REASON), one entry per worktree in the
+# order git reports them.
 _wt_scan() {
-  local line wt_path='' wt_branch='' wt_prunable=''
+  local line wt_path='' wt_branch='' wt_prunable='' wt_locked='' wt_reason=''
 
   WT_PATHS=()
   WT_BRANCHES=()
   WT_PRUNABLE=()
+  WT_LOCKED=()
+  WT_LOCK_REASON=()
 
   while IFS= read -r line; do
     if [[ "$line" =~ ^worktree\ (.+)$ ]]; then
       wt_path="${BASH_REMATCH[1]}"
       wt_branch=''
       wt_prunable=''
+      wt_locked=''
+      wt_reason=''
     elif [[ "$line" =~ ^branch\ refs/heads/(.+)$ ]]; then
       wt_branch="${BASH_REMATCH[1]}"
     elif [[ "$line" =~ ^prunable ]]; then
       wt_prunable=1
+    elif [[ "$line" =~ ^locked( (.*))?$ ]]; then
+      # `locked` alone, or `locked <reason>` written by git worktree lock.
+      wt_locked=1
+      wt_reason="${BASH_REMATCH[2]:-}"
     elif [[ -z "$line" && -n "$wt_path" ]]; then
+      # git never reports a locked entry as prunable, so a locked worktree
+      # whose directory has been deleted looks healthy in the porcelain
+      # output. Check the directory too: either way the entry is stale.
+      local stale="$wt_prunable"
+      if [[ -z "$stale" && ! -d "$wt_path" ]]; then
+        stale=1
+      fi
+
       WT_PATHS[${#WT_PATHS[@]}]="$wt_path"
       WT_BRANCHES[${#WT_BRANCHES[@]}]="${wt_branch:-(detached)}"
-      WT_PRUNABLE[${#WT_PRUNABLE[@]}]="$wt_prunable"
+      WT_PRUNABLE[${#WT_PRUNABLE[@]}]="$stale"
+      WT_LOCKED[${#WT_LOCKED[@]}]="$wt_locked"
+      WT_LOCK_REASON[${#WT_LOCK_REASON[@]}]="$wt_reason"
       wt_path=''
       wt_branch=''
       wt_prunable=''
+      wt_locked=''
+      wt_reason=''
     fi
   done < <(git worktree list --porcelain; printf '\n')
 }
 
 _wt_list() {
-  local current branch path note style i n
+  local current branch path note style i k n
+  local -a notes=()
 
   _wt_scan
   current=$(git rev-parse --show-toplevel 2>/dev/null) || current=''
@@ -454,25 +515,44 @@ _wt_list() {
   for (( i = 0; i < n; i++ )); do
     branch="${WT_BRANCHES[$i]}"
     path=$(_wt_relpath "${WT_PATHS[$i]}")
-    note=''
+    notes=()
     style=''
 
     if [[ -n "${WT_PRUNABLE[$i]}" ]]; then
-      note='missing directory'
+      notes[${#notes[@]}]='missing directory'
       style="$C_RED"
-    elif [[ "$branch" == '(detached)' ]]; then
-      note='detached'
-      style="$C_YELLOW"
+    fi
+
+    if [[ -n "${WT_LOCKED[$i]}" ]]; then
+      if [[ -n "${WT_LOCK_REASON[$i]}" ]]; then
+        notes[${#notes[@]}]="locked: ${WT_LOCK_REASON[$i]}"
+      else
+        notes[${#notes[@]}]='locked'
+      fi
+      if [[ -z "$style" ]]; then
+        style="$C_YELLOW"
+      fi
+    fi
+
+    if [[ "$branch" == '(detached)' ]]; then
+      notes[${#notes[@]}]='detached'
+      if [[ -z "$style" ]]; then
+        style="$C_YELLOW"
+      fi
     fi
 
     if [[ -n "$current" && "${WT_PATHS[$i]}" == "$current" ]]; then
-      if [[ -n "$note" ]]; then
-        note="${note}, current"
-      else
-        note='current'
-      fi
+      notes[${#notes[@]}]='current'
       style="$C_GREEN"
     fi
+
+    note=''
+    for (( k = 0; k < ${#notes[@]}; k++ )); do
+      if [[ -n "$note" ]]; then
+        note+=', '
+      fi
+      note+="${notes[$k]}"
+    done
 
     table_add_styled "$style" "$branch" "$path" "$note"
   done
@@ -480,6 +560,7 @@ _wt_list() {
 
   printf '\n'
   muted "g worktree PATTERN opens or creates one; g worktree -r BRANCH removes it."
+  printf '\n'
 }
 
 _wt_base_refs() {
@@ -623,6 +704,7 @@ _wt_status() {
   if [[ "$WT_HAS_ORIGIN" == "true" ]]; then
     muted "Run 'git fetch --prune' first for an up-to-date remote state."
   fi
+  printf '\n'
 }
 
 _wt_resolve_base_branch() {
@@ -794,6 +876,7 @@ _wt_select() {
   done
 
   printf '\033[?25h' >&2
+  printf '\n' >&2
   trap - EXIT INT TERM
   printf '%s\n' "$selected"
 }
@@ -810,15 +893,16 @@ _wt_create() {
   if [[ "$is_new" == "true" ]]; then
     base=$(_wt_resolve_base_branch)
     info "creating worktree with new branch '${branch}' from ${base}"
-    git worktree add -b "$branch" "$wpath" "$base" >&2
+    git worktree add -b "$branch" "$wpath" "$base" 2>&1 | relay
   elif git show-ref --verify --quiet "refs/heads/$branch"; then
     info "creating worktree for '${branch}'"
-    git worktree add "$wpath" "$branch" >&2
+    git worktree add "$wpath" "$branch" 2>&1 | relay
   else
     info "creating worktree tracking 'origin/${branch}'"
-    git worktree add --track -b "$branch" "$wpath" "origin/$branch" >&2
+    git worktree add --track -b "$branch" "$wpath" "origin/$branch" 2>&1 | relay
   fi
 
+  printf '\n' >&2
   _wt_relpath "$wpath"
 }
 
@@ -853,9 +937,13 @@ _wt_handle_branch() {
   if (( n == 0 )); then
     _wt_validate_branch_name "$pattern"
     info "no branches match '${pattern}'"
+    printf '\n' >&2
+    if ! have_tty; then
+      die "no terminal is available to ask whether to create '${pattern}'"
+    fi
     if ! ask_yes_no "Create new branch '${pattern}'?"; then
-      err 'aborted'
-      return 1
+      printf '\n' >&2
+      die 'aborted'
     fi
     _wt_create "$pattern" true
     return 0
@@ -876,9 +964,12 @@ _wt_handle_branch() {
   if [[ ! -t 2 ]]; then
     err "${n} branches match '${pattern}' and no terminal is available to choose from"
     for (( i = 0; i < n; i++ )); do
-      printf '  %s\n' "${all[$i]}" >&2
+      detail "  ${all[$i]}"
     done
-    die 'pass a more specific pattern'
+    printf '\n' >&2
+    detail 'Run this in a terminal to pick one, or pass a more specific pattern.'
+    printf '\n' >&2
+    return 1
   fi
 
   local -a display=()
@@ -933,7 +1024,7 @@ _wt_handle_branch() {
 }
 
 _wt_remove() {
-  local branch="$1" wt_path out
+  local branch="$1" wt_path out line
 
   wt_path=$(_wt_existing_for_branch "$branch")
   if [[ -z "$wt_path" ]]; then
@@ -950,24 +1041,69 @@ _wt_remove() {
 
   if out=$(git worktree "$@" 2>&1); then
     if [[ -n "$out" ]]; then
-      printf '%s\n' "$out" >&2
+      printf '%s\n' "$out" | relay
     fi
+    printf '\n' >&2
     return 0
   fi
 
-  printf '%s\n' "$out" >&2
-  if [[ "$out" == *'use --force'* ]]; then
-    info "pass -f to force removal, e.g. g wt -rf ${branch}"
-    git -C "$wt_path" status --short --untracked-files=all >&2 || true
+  printf '\n' >&2
+
+  # Everything below explains the failure above it, so it is set in one level.
+  local saved_indent="$G_INDENT"
+  G_INDENT='  '
+
+  if [[ "$out" == *'contains modified or untracked files'* ]] ||
+    [[ "$out" == *'use --force'* ]]; then
+    err "cannot remove the worktree for '${branch}'"
+    detail "$(_wt_relpath "$wt_path") holds changes that are not committed anywhere."
+    printf '\n' >&2
+
+    if git -C "$wt_path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      detail 'Uncommitted files:'
+      while IFS= read -r line; do
+        if [[ -n "$line" ]]; then
+          detail "  ${line}"
+        fi
+      done < <(git -C "$wt_path" status --short --untracked-files=all 2>/dev/null)
+      printf '\n' >&2
+    fi
+
+    detail 'Removing the worktree would discard them, so git refuses. Commit or'
+    detail 'stash the changes first, or discard them and remove it anyway with:'
+    printf '\n%s    %s%s%s\n' "$G_INDENT" "$E_BOLD" "g wt -rf ${branch}" "$E_RESET" >&2
+  elif [[ "$out" == *'locked working tree'* ]]; then
+    err "cannot remove the worktree for '${branch}'"
+    detail "$(_wt_relpath "$wt_path") is locked, so git will not remove it."
+    printf '\n' >&2
+    detail 'Unlock it first, then remove it again:'
+    printf '\n%s    %s%s%s\n' "$G_INDENT" "$E_BOLD" \
+      "git worktree unlock $(_wt_relpath "$wt_path")" "$E_RESET" >&2
+  else
+    printf '%s\n' "$out" | relay
   fi
+
+  G_INDENT="$saved_indent"
+  printf '\n' >&2
   return 1
 }
 
 _wt_fetch() {
-  local branch="$1" existing
+  local branch="$1" existing out
 
-  if ! git fetch origin "$branch" >&2; then
-    die "failed to fetch '${branch}' from origin"
+  info "fetching '${branch}' from origin"
+  if ! out=$(git fetch origin "$branch" 2>&1); then
+    printf '\n' >&2
+    err "failed to fetch '${branch}' from origin"
+    if [[ -n "$out" ]]; then
+      printf '%s\n' "$out" | relay
+    fi
+    printf '\n' >&2
+    return 1
+  fi
+  if [[ -n "$out" ]]; then
+    printf '%s\n' "$out" | relay
+    printf '\n' >&2
   fi
 
   if ! git show-ref --verify --quiet "refs/remotes/origin/${branch}"; then
@@ -1009,6 +1145,8 @@ Options:
 The worktree path is printed on stdout and everything else on stderr, so
 `cd "$(g wt feature/thing)"` works.
 EOF
+
+  printf '\n'
 }
 
 # ── Commands ────────────────────────────────────────────────────────────────
@@ -1131,6 +1269,8 @@ Global options:
 Environment:
   NO_COLOR            Disable colour and effects (https://no-color.org)
 EOF
+
+  printf '\n'
 }
 
 # Dispatch. Add a case branch here, then extend usage() and the README table in

@@ -59,6 +59,20 @@ in the branch name replaced by `-`. A pattern opens the worktree for the
 matching branch; several matches open a picker, and a `SECTION/NAME` pattern
 that matches nothing offers to create the branch.
 
+The listing has three columns — `BRANCH`, `PATH` (relative to where you are)
+and `NOTE`:
+
+| NOTE | Meaning |
+| --- | --- |
+| `current` | the worktree your shell is in |
+| `detached` | the worktree has no branch |
+| `locked` / `locked: <reason>` | protected by `git worktree lock`; `-r` will refuse until it is unlocked |
+| `missing directory` | the registration points at a directory that no longer exists |
+
+Notes combine, so a locked worktree whose directory was deleted reads
+`missing directory, locked: kept for review`. Rows are coloured green when
+current, yellow when detached or locked, and red when the directory is missing.
+
 `-s` checks `develop`/`dev`/`main`/`master`, locally and on `origin`, and
 recognises both merge commits and squash merges. Run `git fetch --prune` first
 for up-to-date remote state.
