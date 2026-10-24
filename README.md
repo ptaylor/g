@@ -25,11 +25,52 @@ g version
 | --- | --- |
 | `g help` | Show usage |
 | `g version` | Show the version |
+| `g branches` | List local branches with their state |
 | `g gc` | Reclaim space in the repository |
 | `g worktree`, `g wt` | List worktrees and open or create one for a branch |
 
 Utilities from `~/bitbucket/pftylr/utils/git` are ported one at a time; each
 one appears in `g help` and in the table above as it lands.
+
+## `g branches`
+
+An overview of local branches — ported from the `git-branch-list` script in
+`~/bitbucket/pftylr/utils/git`.
+
+```bash
+g branches        # your own branches, newest first
+g branches -a     # include branches by other authors
+g branches -m     # only what is safe to delete
+```
+
+```
+Branches
+────────
+BRANCH          AUTHOR        CMTS  FIRST       LAST                         STATUS
+──────────────  ────────────  ────  ──────────  ───────────────────────────  ─────────────────
+main            Paul Taylor      4  2026-10-10  2026-10-24 (2 minutes ago)  current
+feature/ahead   Paul Taylor      2  2026-10-20  2026-10-23 (1 day ago)      +2/-1
+feature/merged  Paul Taylor      0  -           2026-10-22 (2 days ago)     merged (deletable)
+
+Base             main
+User             Paul Taylor
+Showing          3 branches, 1 merged (safe to delete)
+
+Delete one with: git branch -d NAME
+```
+
+`CMTS` counts only the branch's own work, from the merge-base with the base, so
+a branch that is already merged shows `0`; `+ahead/-behind` is relative to the
+base. Rows are cyan for the branch you are on and green for one that is merged
+and safe to delete.
+
+The base is the first of `main`, `master`, `develop` that exists, local before
+origin — a branch merged here is deletable here whether or not the merge has
+been pushed. `g wt -s` looks at origin's copy instead, because it answers a
+different question: whether the branch has been merged upstream.
+
+`-m` leaves out the base branch and the branch you are on, since neither can be
+deleted.
 
 ## `g gc`
 

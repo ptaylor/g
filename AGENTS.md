@@ -11,10 +11,10 @@ is pleasant on a terminal and clean in a pipe.
 
 ## Status
 
-WIP. The dispatch skeleton, the presentation layer, and two ported commands —
-`worktree` (alias `wt`) and `gc` — are in place. Further commands are ported
-one at a time from `~/bitbucket/pftylr/utils/git` and must not be assumed to
-exist until they appear in `g help`.
+WIP. The dispatch skeleton, the presentation layer, and three ported commands —
+`worktree` (alias `wt`), `gc` and `branches` — are in place. Further commands
+are ported one at a time from `~/bitbucket/pftylr/utils/git` and must not be
+assumed to exist until they appear in `g help`.
 
 ## Commands
 
@@ -26,6 +26,7 @@ exist until they appear in `g help`.
 ./g version                   # version
 ./g wt                        # list worktrees
 ./g wt -s                     # worktree status report
+./g branches                  # local branches with their state
 ./g gc -n                     # what a cleanup would do, without doing it
 
 ./g help | cat                # verify plain (piped) mode
@@ -138,7 +139,8 @@ Rules:
   deviations: `worktree -c/--check` is `g wt -s/--status`; `g gc` measures the
   git directory rather than the working tree, and neither expires the reflog
   nor repacks aggressively unless asked, because the original did both
-  unconditionally.
+  unconditionally; `g branches -m` also hides the base branch and the current
+  one, which the original listed even though git cannot delete either.
 - **Separate blocks, end with a blank line.** Human-facing output leaves a
   blank line between the result and the hints that follow it, between a prompt
   and whatever comes next, and at the very end. A blank line that only exists

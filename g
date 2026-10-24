@@ -109,6 +109,15 @@ _repeat() {
   printf '%s' "${out// /$ch}"
 }
 
+# _plural N ONE MANY — the word that agrees with N.
+_plural() {
+  if (( $1 == 1 )); then
+    printf '%s' "$2"
+  else
+    printf '%s' "$3"
+  fi
+}
+
 _rule() {
   local ch='-'
   if (( G_UNICODE )); then
@@ -1158,6 +1167,247 @@ EOF
   printf '\n'
 }
 
+# ── g branches ──────────────────────────────────────────────────────────────
+# Ported from ~/bitbucket/pftylr/utils/git/git-branch-list. The integration
+# branch is looked up in the same order the worktree command uses, so both
+# commands name the same base in a given repository.
+
+BR_SHOW_ALL=false
+BR_MERGED_ONLY=false
+
+# base_ref — the integration branch for `g branches`: the first of main,
+# master, develop that exists, local before origin. A branch merged here is
+# deletable here whether or not the merge has been pushed. (`g wt -s` asks a
+# different question — is it merged upstream yet — so it prefers origin's copy.)
+base_ref() {
+  local b
+  for b in main master develop; do
+    if git rev-parse --verify --quiet "$b" >/dev/null 2>&1; then
+      printf '%s\n' "$b"
+      return 0
+    fi
+    if git rev-parse --verify --quiet "origin/$b" >/dev/null 2>&1; then
+      printf 'origin/%s\n' "$b"
+      return 0
+    fi
+  done
+  return 0
+}
+
+br_usage() {
+  section "g branches — local branches at a glance"
+
+  cat <<'EOF'
+Usage:
+  g branches [options]
+
+Lists local branches with their author, commit count, first and last commit,
+and whether the branch is safe to delete.
+
+Options:
+  -a, --all      Include branches by other authors (the default shows yours)
+  -m, --merged   Only show branches already merged into the base branch,
+                 leaving out the base and the branch you are on
+  -h, --help     Show this help
+
+The base branch is the first of main, master, develop that exists, local
+before origin. Commits are counted from the merge-base with the base, so a
+branch's own work is what gets measured, and STATUS reads `current`,
+`merged (deletable)` or `+ahead/-behind`.
+
+`g wt -s` looks at origin's copy of the base instead, because it answers a
+different question: whether the branch has been merged upstream.
+EOF
+
+  printf '\n'
+}
+
+cmd_branches() {
+  BR_SHOW_ALL=false
+  BR_MERGED_ONLY=false
+
+  while (( $# )); do
+    case "$1" in
+      -h|--help)
+        br_usage
+        return 0
+        ;;
+      -a|--all)    BR_SHOW_ALL=true;    shift ;;
+      -m|--merged) BR_MERGED_ONLY=true; shift ;;
+      -[!-]?*)
+        local flags="${1#-}"
+        local -a split=()
+        shift
+        while [[ -n "$flags" ]]; do
+          split[${#split[@]}]="-${flags:0:1}"
+          flags="${flags:1}"
+        done
+        set -- "${split[@]}" "$@"
+        ;;
+      -*) die "unknown option: $1" ;;
+      *)  die 'usage: g branches [-a] [-m]' ;;
+    esac
+  done
+
+  require_repo
+
+  local me base current
+  me=$(git config user.name || true)
+  if [[ -z "$me" ]]; then
+    die 'git user.name is not configured'
+  fi
+
+  base=$(base_ref)
+  current=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) || current=''
+
+  local -a merged_branches=()
+  local b
+  if [[ -n "$base" ]]; then
+    while IFS= read -r b; do
+      if [[ -n "$b" ]]; then
+        merged_branches[${#merged_branches[@]}]="$b"
+      fi
+    done < <(git branch --merged "$base" --format='%(refname:short)' 2>/dev/null || true)
+  fi
+
+  local branch author created marker range mb count first last_date last_rel
+  local ahead behind status style display_last is_merged
+  local total=0 merged_shown=0 k n_merged
+
+  n_merged=${#merged_branches[@]}
+  local -a branches=()
+  local -a authors=()
+  local -a counts=()
+  local -a firsts=()
+  local -a lasts=()
+  local -a statuses=()
+  local -a styles=()
+
+  while IFS='|' read -r branch author created; do
+    if [[ -z "$branch" ]]; then
+      continue
+    fi
+
+    if [[ "$BR_SHOW_ALL" != "true" && "$author" != "$me" ]]; then
+      continue
+    fi
+
+    is_merged=false
+    for (( k = 0; k < n_merged; k++ )); do
+      if [[ "${merged_branches[$k]}" == "$branch" ]]; then
+        is_merged=true
+        break
+      fi
+    done
+
+    if [[ "$BR_MERGED_ONLY" == "true" ]]; then
+      if [[ "$is_merged" != "true" ]]; then
+        continue
+      fi
+      # The base branch and the one you are on are not deletion candidates.
+      if [[ "$branch" == "$current" || "$branch" == "$base" ||
+        "$branch" == "${base#origin/}" ]]; then
+        continue
+      fi
+    fi
+
+    # Count only this branch's own work, not the base's history.
+    range="$branch"
+    if [[ -n "$base" && "$branch" != "$base" && "$branch" != "${base#origin/}" ]]; then
+      mb=$(git merge-base "$base" "$branch" 2>/dev/null) || mb=''
+      if [[ -n "$mb" ]]; then
+        range="${mb}..${branch}"
+      fi
+    fi
+
+    count=$(git rev-list --count "$range" 2>/dev/null) || count='?'
+    first=$(git log "$range" --format='%cs' --reverse 2>/dev/null | head -1) || true
+    if [[ -z "$first" ]]; then
+      first='-'
+    fi
+
+    # The tip's date, taken from the branch itself: for a merged branch the
+    # merge-base range is empty, and two dashes said less than the real date.
+    last_date=''
+    last_rel=''
+    IFS='|' read -r last_date last_rel < <(
+      git log -1 --format='%cs|%cr' "$branch" 2>/dev/null || true
+    ) || true
+    if [[ -z "$last_date" ]]; then
+      last_date='-'
+      display_last='-'
+    elif [[ -n "$last_rel" ]]; then
+      display_last="${last_date} (${last_rel})"
+    else
+      display_last="$last_date"
+    fi
+
+    status=''
+    style=''
+    if [[ "$branch" == "$current" ]]; then
+      status='current'
+      style="$C_CYAN"
+    elif [[ "$is_merged" == "true" ]]; then
+      status='merged (deletable)'
+      style="$C_GREEN"
+      merged_shown=$(( merged_shown + 1 ))
+    elif [[ -n "$base" ]]; then
+      ahead=$(git rev-list --count "${base}..${branch}" 2>/dev/null) || ahead=0
+      behind=$(git rev-list --count "${branch}..${base}" 2>/dev/null) || behind=0
+      status="+${ahead}/-${behind}"
+    fi
+
+    marker=''
+    if [[ "$BR_SHOW_ALL" == "true" && "$author" == "$me" ]]; then
+      marker=' (me)'
+    fi
+
+    branches[${#branches[@]}]="$branch"
+    authors[${#authors[@]}]="${author}${marker}"
+    counts[${#counts[@]}]="$count"
+    firsts[${#firsts[@]}]="$first"
+    lasts[${#lasts[@]}]="$display_last"
+    statuses[${#statuses[@]}]="$status"
+    styles[${#styles[@]}]="$style"
+    total=$(( total + 1 ))
+  done < <(git for-each-ref --format='%(refname:short)|%(authorname)|%(creatordate:short)' \
+    refs/heads/ --sort=-committerdate)
+
+  section 'Branches'
+
+  if (( total == 0 )); then
+    printf '\n'
+    muted 'No branches to show.'
+  else
+    table_begin
+    table_add 'BRANCH' 'AUTHOR' "$(printf '%5s' 'CMTS')" 'FIRST' 'LAST' 'STATUS'
+    for (( k = 0; k < total; k++ )); do
+      table_add_styled "${styles[$k]}" \
+        "${branches[$k]}" "${authors[$k]}" "$(printf '%5s' "${counts[$k]}")" \
+        "${firsts[$k]}" "${lasts[$k]}" "${statuses[$k]}"
+    done
+    table_flush
+  fi
+
+  printf '\n'
+  if [[ -n "$base" ]]; then
+    kv 'Base' "$base"
+  else
+    kv 'Base' 'none found (develop, dev, main, master)'
+  fi
+  kv 'User' "$me"
+  if (( merged_shown > 0 )); then
+    kv 'Showing' "$(_plural "$total" '1 branch' "${total} branches"), ${merged_shown} merged (safe to delete)"
+  else
+    kv 'Showing' "$(_plural "$total" '1 branch' "${total} branches")"
+  fi
+  printf '\n'
+  if (( merged_shown > 0 )); then
+    muted 'Delete one with: git branch -d NAME'
+    printf '\n'
+  fi
+}
+
 # ── Commands ────────────────────────────────────────────────────────────────
 
 cmd_version() {
@@ -1196,14 +1446,6 @@ _gc_counts() {
       printf "%d pack%s, %d loose object%s",
         p, (p == 1 ? "" : "s"), c, (c == 1 ? "" : "s")
     }'
-}
-
-_gc_plural() {
-  if (( $1 == 1 )); then
-    printf '%s' "$2"
-  else
-    printf '%s' "$3"
-  fi
 }
 
 # _gc_step OK_TEXT FAIL_TEXT COMMAND... — run one cleanup step, reporting the
@@ -1247,7 +1489,7 @@ _gc_prune_remotes() {
 
   n=$(printf '%s\n' "$out" | grep -c '\[pruned\]' || true)
   if (( n > 0 )); then
-    step "pruned ${n} stale remote-tracking $(_gc_plural "$n" ref refs) from origin"
+    step "pruned ${n} stale remote-tracking $(_plural "$n" ref refs) from origin"
   else
     step 'no stale remote-tracking refs on origin'
   fi
@@ -1523,6 +1765,7 @@ Usage:
 Commands:
   help                Show this help
   version             Show the version
+  branches            List local branches with their state
   gc                  Reclaim space in the repository
   worktree, wt        List worktrees and open or create one for a branch
 
@@ -1562,6 +1805,9 @@ run_cmd() {
       ;;
     gc)
       cmd_gc "$@"
+      ;;
+    branches)
+      cmd_branches "$@"
       ;;
     -*)
       err "unknown option: ${cmd}"
