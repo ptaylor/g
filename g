@@ -153,6 +153,15 @@ muted() {
   printf '%s%s%s\n' "$C_DIM" "$*" "$C_RESET"
 }
 
+# step TEXT — one completed step of a report, on stdout.
+step() {
+  local glyph='+'
+  if (( G_UNICODE )); then
+    glyph='✓'
+  fi
+  printf '  %s%s%s %s\n' "$C_GREEN" "$glyph" "$C_RESET" "$*"
+}
+
 # detail TEXT... — an indented continuation line on stderr, for the second and
 # later lines of a message that needs more than one. Nests under G_INDENT.
 detail() {
@@ -1155,6 +1164,265 @@ cmd_version() {
   printf '%s %s\n' "$G_PROG" "$G_VERSION"
 }
 
+# ── g gc ────────────────────────────────────────────────────────────────────
+# Ported from ~/bitbucket/pftylr/utils/git/git-gc-repo, with three deliberate
+# changes: the space is measured in the git directory rather than the whole
+# working tree, `--aggressive` is opt-in, and the reflog is only expired when
+# the caller asks for it — that step is the only irreversible one.
+
+GC_DRY_RUN=false
+GC_AGGRESSIVE=false
+GC_MAINTENANCE=false
+GC_PRUNE_NOW=false
+GC_YES=false
+
+_gc_human_kb() {
+  awk -v kb="${1:-0}" 'BEGIN {
+    if (kb >= 1048576) printf "%.1f GiB", kb / 1048576
+    else if (kb >= 1024) printf "%.1f MiB", kb / 1024
+    else printf "%d KiB", kb
+  }'
+}
+
+_gc_size_kb() {
+  du -sk "$1" 2>/dev/null | awk '{ print $1 }'
+}
+
+_gc_counts() {
+  git count-objects -v 2>/dev/null | awk '
+    /^count:/ { c = $2 }
+    /^packs:/ { p = $2 }
+    END {
+      printf "%d pack%s, %d loose object%s",
+        p, (p == 1 ? "" : "s"), c, (c == 1 ? "" : "s")
+    }'
+}
+
+_gc_plural() {
+  if (( $1 == 1 )); then
+    printf '%s' "$2"
+  else
+    printf '%s' "$3"
+  fi
+}
+
+# _gc_step OK_TEXT FAIL_TEXT COMMAND... — run one cleanup step, reporting the
+# outcome. git's own output is relayed under the step when there is any.
+_gc_step() {
+  local ok_text="$1" fail_text="$2" out
+  shift 2
+
+  if out=$("$@" 2>&1); then
+    step "$ok_text"
+    if [[ -n "$out" ]]; then
+      printf '%s\n' "$out" | relay
+    fi
+    return 0
+  fi
+
+  printf '\n' >&2
+  err "$fail_text"
+  if [[ -n "$out" ]]; then
+    printf '%s\n' "$out" | relay
+  fi
+  printf '\n' >&2
+  return 1
+}
+
+_gc_prune_remotes() {
+  local out n
+
+  if ! git remote | grep -qx origin; then
+    step 'no origin remote, nothing to prune'
+    return 0
+  fi
+
+  if ! out=$(git remote prune origin 2>&1); then
+    printf '\n' >&2
+    err 'pruning stale remote-tracking branches failed'
+    printf '%s\n' "$out" | relay
+    printf '\n' >&2
+    return 1
+  fi
+
+  n=$(printf '%s\n' "$out" | grep -c '\[pruned\]' || true)
+  if (( n > 0 )); then
+    step "pruned ${n} stale remote-tracking $(_gc_plural "$n" ref refs) from origin"
+  else
+    step 'no stale remote-tracking refs on origin'
+  fi
+}
+
+gc_usage() {
+  section "g gc — reclaim space in this repository"
+
+  cat <<'EOF'
+Usage:
+  g gc [options]
+
+Prunes stale remote-tracking refs and runs garbage collection, reporting the
+size of the git directory before and after.
+
+Options:
+  -n, --dry-run      Report the size and the commands that would run, and
+                     change nothing
+  -a, --aggressive   Pass --aggressive to git gc: slower, and rarely worth it
+  -m, --maintenance  Run `git maintenance run` instead of `git gc`, which
+                     follows maintenance.strategy (geometric by default)
+  -p, --prune-now    Expire the reflog and drop unreachable objects now.
+                     Destructive: objects that only the reflog still reached
+                     become unrecoverable
+  -y, --yes          Skip the confirmation that -p otherwise asks for
+  -h, --help         Show this help
+
+What `git gc` already does, so g does not repeat it:
+  repacks, prunes packed objects, rewrites the commit-graph, expires reflog
+  entries (90 days, 30 for unreachable ones), drops unreachable objects older
+  than two weeks, and prunes worktree registrations missing for three months.
+
+Other cleanup git offers, which g leaves alone:
+  git clean -fdx        delete untracked and ignored files in the worktree
+  git worktree remove   remove another checkout
+  git maintenance start schedule upkeep in the background
+
+The original git-gc-repo always expired the reflog and always repacked
+aggressively; both are opt-in here.
+EOF
+
+  printf '\n'
+}
+
+cmd_gc() {
+  GC_DRY_RUN=false
+  GC_AGGRESSIVE=false
+  GC_MAINTENANCE=false
+  GC_PRUNE_NOW=false
+  GC_YES=false
+
+  while (( $# )); do
+    case "$1" in
+      -h|--help)
+        gc_usage
+        return 0
+        ;;
+      -n|--dry-run)   GC_DRY_RUN=true;    shift ;;
+      -a|--aggressive) GC_AGGRESSIVE=true; shift ;;
+      -m|--maintenance) GC_MAINTENANCE=true; shift ;;
+      -p|--prune-now) GC_PRUNE_NOW=true;  shift ;;
+      -y|--yes)       GC_YES=true;        shift ;;
+      -[!-]?*)
+        local flags="${1#-}"
+        local -a split=()
+        shift
+        while [[ -n "$flags" ]]; do
+          split[${#split[@]}]="-${flags:0:1}"
+          flags="${flags:1}"
+        done
+        set -- "${split[@]}" "$@"
+        ;;
+      -*) die "unknown option: $1" ;;
+      *)  die 'usage: g gc [options]' ;;
+    esac
+  done
+
+  if [[ "$GC_MAINTENANCE" == "true" &&
+    ( "$GC_AGGRESSIVE" == "true" || "$GC_PRUNE_NOW" == "true" ) ]]; then
+    die '--maintenance cannot be combined with --aggressive or --prune-now'
+  fi
+
+  require_repo
+
+  local git_dir before_kb after_kb delta_kb top desc
+  git_dir=$(cd "$(git rev-parse --git-common-dir)" && pwd -P)
+  top=$(git rev-parse --show-toplevel)
+  before_kb=$(_gc_size_kb "$git_dir")
+
+  section 'Git repository cleanup'
+  kv 'Repository' "$top"
+  kv 'Before' "$(paint "$C_BOLD" "$(_gc_human_kb "$before_kb")")  ($(_gc_counts))"
+
+  local -a gc_args=(gc)
+  if [[ "$GC_AGGRESSIVE" == "true" ]]; then
+    gc_args[${#gc_args[@]}]='--aggressive'
+  fi
+  if [[ "$GC_PRUNE_NOW" == "true" ]]; then
+    gc_args[${#gc_args[@]}]='--prune=now'
+  fi
+
+  if [[ "$GC_DRY_RUN" == "true" ]]; then
+    printf '\n'
+    muted 'Would run'
+    if git remote | grep -qx origin; then
+      printf '  %s\n' 'git remote prune origin'
+    fi
+    if [[ "$GC_PRUNE_NOW" == "true" ]]; then
+      printf '  %s\n' 'git reflog expire --expire=now --all'
+    fi
+    if [[ "$GC_MAINTENANCE" == "true" ]]; then
+      printf '  %s\n' 'git maintenance run'
+    else
+      printf '  %s\n' "git ${gc_args[*]}"
+    fi
+    printf '\n'
+    muted 'Nothing was changed.'
+    printf '\n'
+    return 0
+  fi
+
+  if [[ "$GC_PRUNE_NOW" == "true" && "$GC_YES" != "true" ]]; then
+    printf '\n' >&2
+    warn 'this expires the reflog and drops unreachable objects immediately'
+    detail 'Commits that only the reflog still reached cannot be recovered afterwards.'
+    printf '\n' >&2
+    if ! have_tty; then
+      die 'no terminal is available to confirm; pass -y to proceed'
+    fi
+    if ! ask_yes_no 'Continue with the destructive cleanup?'; then
+      printf '\n' >&2
+      die 'aborted'
+    fi
+  fi
+
+  printf '\n'
+
+  _gc_prune_remotes
+
+  if [[ "$GC_PRUNE_NOW" == "true" ]]; then
+    _gc_step 'reflog expired' 'expiring the reflog failed' \
+      git reflog expire --expire=now --all
+  fi
+
+  desc='garbage collection complete'
+  if [[ "$GC_AGGRESSIVE" == "true" ]]; then
+    desc="aggressive ${desc}"
+  fi
+  if [[ "$GC_PRUNE_NOW" == "true" ]]; then
+    desc="${desc}, unreachable objects dropped"
+  fi
+  if [[ "$GC_MAINTENANCE" == "true" ]]; then
+    _gc_step 'maintenance run complete' 'maintenance run failed' \
+      git maintenance run
+  else
+    _gc_step "$desc" 'garbage collection failed' git "${gc_args[@]}"
+  fi
+
+  printf '\n'
+
+  after_kb=$(_gc_size_kb "$git_dir")
+  delta_kb=$(( before_kb - after_kb ))
+
+  kv 'After' "$(paint "$C_BOLD" "$(_gc_human_kb "$after_kb")")  ($(_gc_counts))"
+  if (( delta_kb > 0 )); then
+    kv 'Reclaimed' "$(paint "$C_GREEN" "$(_gc_human_kb "$delta_kb")")"
+  elif (( delta_kb < 0 )); then
+    kv 'Grew by' "$(paint "$C_RED" "$(_gc_human_kb "$(( -delta_kb ))")")"
+  else
+    kv 'Reclaimed' 'nothing'
+  fi
+
+  printf '\n'
+}
+
 cmd_worktree() {
   WT_MODE=''
   WT_FORCE=false
@@ -1255,6 +1523,7 @@ Usage:
 Commands:
   help                Show this help
   version             Show the version
+  gc                  Reclaim space in the repository
   worktree, wt        List worktrees and open or create one for a branch
 
 Utilities are ported one at a time from ~/bitbucket/pftylr/utils/git and appear
@@ -1290,6 +1559,9 @@ run_cmd() {
       ;;
     worktree|wt)
       cmd_worktree "$@"
+      ;;
+    gc)
+      cmd_gc "$@"
       ;;
     -*)
       err "unknown option: ${cmd}"

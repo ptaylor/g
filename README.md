@@ -25,10 +25,58 @@ g version
 | --- | --- |
 | `g help` | Show usage |
 | `g version` | Show the version |
+| `g gc` | Reclaim space in the repository |
 | `g worktree`, `g wt` | List worktrees and open or create one for a branch |
 
 Utilities from `~/bitbucket/pftylr/utils/git` are ported one at a time; each
 one appears in `g help` and in the table above as it lands.
+
+## `g gc`
+
+Reclaims space in the current repository — ported from the `git-gc-repo` script
+in `~/bitbucket/pftylr/utils/git`.
+
+```bash
+g gc              # prune stale remote-tracking refs, then collect
+g gc -n           # what it would do, and the current size
+g gc -a           # aggressive repack (slow, rarely worth it)
+g gc -m           # follow maintenance.strategy instead of plain gc
+g gc -p           # also expire the reflog and drop unreachable objects now
+```
+
+| Option | Meaning |
+| --- | --- |
+| `-n, --dry-run` | Report the size and the commands, change nothing |
+| `-a, --aggressive` | Pass `--aggressive` to `git gc` |
+| `-m, --maintenance` | Run `git maintenance run` instead of `git gc` |
+| `-p, --prune-now` | Expire the reflog and drop unreachable objects now |
+| `-y, --yes` | Skip the confirmation that `-p` asks for |
+
+The size measured is the git directory, not the working tree, and it comes from
+`du` plus `git count-objects`, so the report shows what actually shrank:
+
+```
+Git repository cleanup
+──────────────────────
+Repository       /Users/paul/project
+Before           652 KiB  (0 packs, 129 loose objects)
+
+  ✓ pruned 1 stale remote-tracking ref from origin
+  ✓ garbage collection complete
+
+After            148 KiB  (1 pack, 0 loose objects)
+Reclaimed        504 KiB
+```
+
+`git gc` already repacks, prunes packed objects, rewrites the commit-graph,
+expires reflog entries, drops unreachable objects older than two weeks and
+prunes worktree registrations missing for three months; `g gc` does not repeat
+any of that, and only the two steps it adds are opt-in.
+
+Unlike the original script, `g gc` never expires the reflog and never repacks
+aggressively unless asked — the first is irreversible, the second rarely pays
+for itself. Destructive cleanup (`git clean -fdx`, `git worktree remove`) and
+scheduled upkeep (`git maintenance start`) are deliberately left to git.
 
 ## `g worktree` (alias `g wt`)
 
