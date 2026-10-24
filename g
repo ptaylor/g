@@ -118,6 +118,78 @@ _plural() {
   fi
 }
 
+# relpath_into VARIABLE TARGET — store TARGET relative to $PWD in VARIABLE.
+# Uses the physical working directory because git reports physical paths — on
+# macOS /tmp is a symlink to /private/tmp. Assigns rather than prints, and
+# splits paths with string operations rather than `read -a` on a herestring,
+# so a loop over thousands of files does not fork or touch the disk per file.
+_REL_CACHE_PWD=''
+_REL_CACHE_FROM=''
+
+relpath_into() {
+  local __rp_name="$1" __rp_target="$2"
+  local __rp_from __rp_out='' __rp_t __rp_f __rp_tc __rp_fc
+  local __rp_ups __rp_rest __rp_i
+
+  if [[ -z "$_REL_CACHE_FROM" || "$_REL_CACHE_PWD" != "$PWD" ]]; then
+    _REL_CACHE_FROM=$(pwd -P)
+    _REL_CACHE_PWD="$PWD"
+  fi
+  __rp_from="$_REL_CACHE_FROM"
+
+  if [[ "$__rp_target" == "$__rp_from" ]]; then
+    printf -v "$__rp_name" '%s' '.'
+    return 0
+  fi
+
+  __rp_t="${__rp_target#/}"
+  __rp_f="${__rp_from#/}"
+  while [[ -n "$__rp_t" && -n "$__rp_f" ]]; do
+    __rp_tc="${__rp_t%%/*}"
+    __rp_fc="${__rp_f%%/*}"
+    if [[ "$__rp_tc" != "$__rp_fc" ]]; then
+      break
+    fi
+    if [[ "$__rp_t" == */* ]]; then
+      __rp_t="${__rp_t#*/}"
+    else
+      __rp_t=''
+    fi
+    if [[ "$__rp_f" == */* ]]; then
+      __rp_f="${__rp_f#*/}"
+    else
+      __rp_f=''
+    fi
+  done
+
+  __rp_ups=0
+  if [[ -n "$__rp_f" ]]; then
+    __rp_ups=1
+    __rp_rest="$__rp_f"
+    while [[ "$__rp_rest" == */* ]]; do
+      __rp_rest="${__rp_rest#*/}"
+      __rp_ups=$(( __rp_ups + 1 ))
+    done
+  fi
+
+  for (( __rp_i = 0; __rp_i < __rp_ups; __rp_i++ )); do
+    __rp_out+='../'
+  done
+  __rp_out+="$__rp_t"
+
+  if [[ -z "$__rp_out" ]]; then
+    __rp_out='.'
+  fi
+  printf -v "$__rp_name" '%s' "$__rp_out"
+}
+
+# relpath TARGET — print TARGET relative to $PWD.
+relpath() {
+  local __rp_path
+  relpath_into __rp_path "$1"
+  printf '%s\n' "$__rp_path"
+}
+
 _rule() {
   local ch='-'
   if (( G_UNICODE )); then
@@ -147,14 +219,22 @@ kv() {
   printf '%s%-*s%s %s\n' "$C_DIM" "${G_LABEL_WIDTH:-16}" "$1" "$C_RESET" "${2-}"
 }
 
+# paint_into VARIABLE COLOUR TEXT — as paint, but assigns instead of printing,
+# for loops where a fork per row would be felt.
+paint_into() {
+  local __p_name="$1" __p_colour="$2"
+  shift 2
+  printf -v "$__p_name" '%s%s%s' "$__p_colour" "$*" "$C_RESET"
+}
+
 # paint COLOUR TEXT — TEXT wrapped in COLOUR for stdout. Plain mode emits the
 # text alone, so callers never have to branch on whether colour is on.
 # Escape bytes count towards a cell's width, so only use this on the last
 # column of a table.
 paint() {
-  local colour="$1"
-  shift
-  printf '%s%s%s' "$colour" "$*" "$C_RESET"
+  local __p_out
+  paint_into __p_out "$@"
+  printf '%s' "$__p_out"
 }
 
 # muted TEXT — dim secondary text on stdout.
@@ -260,6 +340,26 @@ table_add_styled() {
   G_TABLE_STYLES[$idx]="$style"
 }
 
+# _split_cells ROW — split ROW on the unit separator into _CELLS. Pure string
+# operations, because a herestring per row costs a temporary file and a table of
+# a few thousand rows turns that into seconds.
+_CELLS=()
+
+_split_cells() {
+  local rest="$1" cell
+  _CELLS=()
+  while true; do
+    if [[ "$rest" == *$'\x1f'* ]]; then
+      cell="${rest%%$'\x1f'*}"
+      _CELLS[${#_CELLS[@]}]="$cell"
+      rest="${rest#*$'\x1f'}"
+    else
+      _CELLS[${#_CELLS[@]}]="$rest"
+      break
+    fi
+  done
+}
+
 table_flush() {
   local n=${#G_TABLE_ROWS[@]}
   if (( n == 0 )); then
@@ -267,17 +367,16 @@ table_flush() {
   fi
 
   local i c len row cell style line pad
-  local -a cells
   local -a widths
   local maxcols=0
 
   for (( i = 0; i < n; i++ )); do
-    IFS=$'\x1f' read -r -a cells <<<"${G_TABLE_ROWS[$i]}"
-    if (( ${#cells[@]} > maxcols )); then
-      maxcols=${#cells[@]}
+    _split_cells "${G_TABLE_ROWS[$i]}"
+    if (( ${#_CELLS[@]} > maxcols )); then
+      maxcols=${#_CELLS[@]}
     fi
-    for (( c = 0; c < ${#cells[@]}; c++ )); do
-      len=${#cells[c]}
+    for (( c = 0; c < ${#_CELLS[@]}; c++ )); do
+      len=${#_CELLS[$c]}
       if (( len > ${widths[c]:-0} )); then
         widths[c]=$len
       fi
@@ -285,7 +384,7 @@ table_flush() {
   done
 
   for (( i = 0; i < n; i++ )); do
-    IFS=$'\x1f' read -r -a cells <<<"${G_TABLE_ROWS[$i]}"
+    _split_cells "${G_TABLE_ROWS[$i]}"
     style="${G_TABLE_STYLES[$i]:-}"
     if (( i == 0 )); then
       style="${C_BOLD}${style}"
@@ -293,7 +392,7 @@ table_flush() {
 
     line=''
     for (( c = 0; c < maxcols; c++ )); do
-      cell="${cells[c]:-}"
+      cell="${_CELLS[$c]:-}"
       if (( c == maxcols - 1 )); then
         line+="$cell"
       else
@@ -397,50 +496,6 @@ _wt_branch_exists() {
     git show-ref --verify --quiet "refs/remotes/origin/$1"
 }
 
-# Print TARGET relative to $PWD. Uses the physical working directory because
-# git reports physical paths — on macOS /tmp is a symlink to /private/tmp.
-_wt_relpath() {
-  local target="$1" from out=''
-  local -a tparts
-  local -a fparts
-  local i=0 common=0 nt nf
-
-  from=$(pwd -P)
-
-  if [[ "$target" == "$from" ]]; then
-    printf '.\n'
-    return 0
-  fi
-
-  IFS='/' read -r -a tparts <<<"${target#/}"
-  IFS='/' read -r -a fparts <<<"${from#/}"
-  nt=${#tparts[@]}
-  nf=${#fparts[@]}
-
-  while (( i < nt && i < nf )); do
-    if [[ "${tparts[$i]}" != "${fparts[$i]}" ]]; then
-      break
-    fi
-    i=$(( i + 1 ))
-  done
-  common=$i
-
-  for (( i = common; i < nf; i++ )); do
-    out+='../'
-  done
-  for (( i = common; i < nt; i++ )); do
-    out+="${tparts[$i]}"
-    if (( i < nt - 1 )); then
-      out+='/'
-    fi
-  done
-
-  if [[ -z "$out" ]]; then
-    out='.'
-  fi
-  printf '%s\n' "$out"
-}
-
 _wt_path_for_branch() {
   printf '%s\n' "${WT_PARENT_DIR}/${WT_REPO_NAME}--${1//\//-}"
 }
@@ -532,7 +587,7 @@ _wt_list() {
   n=${#WT_PATHS[@]}
   for (( i = 0; i < n; i++ )); do
     branch="${WT_BRANCHES[$i]}"
-    path=$(_wt_relpath "${WT_PATHS[$i]}")
+    path=$(relpath "${WT_PATHS[$i]}")
     notes=()
     style=''
 
@@ -905,7 +960,7 @@ _wt_create() {
   wpath=$(_wt_path_for_branch "$branch")
 
   if [[ -d "$wpath" ]]; then
-    die "directory already exists: $(_wt_relpath "$wpath")"
+    die "directory already exists: $(relpath "$wpath")"
   fi
 
   if [[ "$is_new" == "true" ]]; then
@@ -921,7 +976,7 @@ _wt_create() {
   fi
 
   printf '\n' >&2
-  _wt_relpath "$wpath"
+  relpath "$wpath"
 }
 
 _wt_handle_branch() {
@@ -933,7 +988,7 @@ _wt_handle_branch() {
   if git show-ref --verify --quiet "refs/heads/${pattern}"; then
     existing=$(_wt_usable_for_branch "$pattern")
     if [[ -n "$existing" ]]; then
-      _wt_relpath "$existing"
+      relpath "$existing"
       return 0
     fi
     _wt_create "$pattern"
@@ -971,7 +1026,7 @@ _wt_handle_branch() {
     branch="${all[0]}"
     existing=$(_wt_usable_for_branch "$branch")
     if [[ -n "$existing" ]]; then
-      _wt_relpath "$existing"
+      relpath "$existing"
       return 0
     fi
     _wt_create "$branch"
@@ -1035,7 +1090,7 @@ _wt_handle_branch() {
   branch="${all[$selected_idx]}"
   existing=$(_wt_usable_for_branch "$branch")
   if [[ -n "$existing" ]]; then
-    _wt_relpath "$existing"
+    relpath "$existing"
     return 0
   fi
   _wt_create "$branch"
@@ -1049,7 +1104,7 @@ _wt_remove() {
     die "no worktree found for branch '${branch}'"
   fi
 
-  info "removing worktree for '${branch}' at $(_wt_relpath "$wt_path")"
+  info "removing worktree for '${branch}' at $(relpath "$wt_path")"
 
   if [[ "$WT_FORCE" == "true" ]]; then
     set -- remove --force "$wt_path"
@@ -1074,7 +1129,7 @@ _wt_remove() {
   if [[ "$out" == *'contains modified or untracked files'* ]] ||
     [[ "$out" == *'use --force'* ]]; then
     err "cannot remove the worktree for '${branch}'"
-    detail "$(_wt_relpath "$wt_path") holds changes that are not committed anywhere."
+    detail "$(relpath "$wt_path") holds changes that are not committed anywhere."
     printf '\n' >&2
 
     if git -C "$wt_path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -1092,11 +1147,11 @@ _wt_remove() {
     printf '\n%s    %s%s%s\n' "$G_INDENT" "$E_BOLD" "g wt -rf ${branch}" "$E_RESET" >&2
   elif [[ "$out" == *'locked working tree'* ]]; then
     err "cannot remove the worktree for '${branch}'"
-    detail "$(_wt_relpath "$wt_path") is locked, so git will not remove it."
+    detail "$(relpath "$wt_path") is locked, so git will not remove it."
     printf '\n' >&2
     detail 'Unlock it first, then remove it again:'
     printf '\n%s    %s%s%s\n' "$G_INDENT" "$E_BOLD" \
-      "git worktree unlock $(_wt_relpath "$wt_path")" "$E_RESET" >&2
+      "git worktree unlock $(relpath "$wt_path")" "$E_RESET" >&2
   else
     printf '%s\n' "$out" | relay
   fi
@@ -1130,7 +1185,7 @@ _wt_fetch() {
 
   existing=$(_wt_usable_for_branch "$branch")
   if [[ -n "$existing" ]]; then
-    _wt_relpath "$existing"
+    relpath "$existing"
     return 0
   fi
 
@@ -1406,6 +1461,172 @@ cmd_branches() {
     muted 'Delete one with: git branch -d NAME'
     printf '\n'
   fi
+}
+
+# ── g untracked ─────────────────────────────────────────────────────────────
+# Ported from ~/bitbucket/pftylr/utils/git/git-untracked.
+#
+# The original ran stat and date once per file: 200 files cost over three
+# seconds here. This asks stat for every file in one batch and formats the
+# sizes in bash, so a large tree still lists instantly.
+
+UT_INCLUDE_IGNORED=false
+
+case "$(uname)" in
+  Darwin)
+    UT_STAT=(-f '%Sm|%m|%z|%N' -t '%Y-%m-%d %H:%M')
+    ;;
+  *)
+    UT_STAT=(-c '%y|%Y|%s|%n')
+    ;;
+esac
+
+# _ut_human_bytes_into VARIABLE BYTES — format a byte count, without forking.
+_ut_human_bytes_into() {
+  local __hb_name="$1" b="${2:-0}"
+  if (( b >= 1073741824 )); then
+    printf -v "$__hb_name" '%d.%d GiB' $(( b / 1073741824 )) $(( (b % 1073741824) * 10 / 1073741824 ))
+  elif (( b >= 1048576 )); then
+    printf -v "$__hb_name" '%d.%d MiB' $(( b / 1048576 )) $(( (b % 1048576) * 10 / 1048576 ))
+  elif (( b >= 1024 )); then
+    printf -v "$__hb_name" '%d.%d KiB' $(( b / 1024 )) $(( (b % 1024) * 10 / 1024 ))
+  else
+    printf -v "$__hb_name" '%d B' "$b"
+  fi
+}
+
+_ut_human_bytes() {
+  local __hb_out
+  _ut_human_bytes_into __hb_out "${1:-0}"
+  printf '%s' "$__hb_out"
+}
+
+ut_usage() {
+  section "g untracked — files git is not tracking yet"
+
+  cat <<'EOF'
+Usage:
+  g untracked [options]
+
+Lists every untracked file in the repository with the date it was last
+modified and its size, newest first. Paths are shown relative to the current
+directory, and the list covers the whole repository, not just this directory.
+
+Options:
+  -a, --all, --ignored   Include ignored files, each marked (ignored)
+  -h, --help             Show this help
+EOF
+
+  printf '\n'
+}
+
+cmd_untracked() {
+  UT_INCLUDE_IGNORED=false
+
+  while (( $# )); do
+    case "$1" in
+      -h|--help)
+        ut_usage
+        return 0
+        ;;
+      -a|--all|--ignored)
+        UT_INCLUDE_IGNORED=true
+        shift
+        ;;
+      -[!-]?*)
+        local flags="${1#-}"
+        local -a split=()
+        shift
+        while [[ -n "$flags" ]]; do
+          split[${#split[@]}]="-${flags:0:1}"
+          flags="${flags:1}"
+        done
+        set -- "${split[@]}" "$@"
+        ;;
+      -*) die "unknown option: $1" ;;
+      *)  die 'usage: g untracked [-a]' ;;
+    esac
+  done
+
+  require_repo
+
+  local root listing
+  root=$(git rev-parse --show-toplevel)
+
+  # Each entry is flag|date|epoch|bytes|path: the flag records whether git
+  # ignores the file, and stat supplies the rest in one call per batch.
+  # A file that vanishes mid-listing makes stat fail, hence the || true.
+  listing=$(
+    {
+      ( cd "$root" && git ls-files -z --others --exclude-standard |
+        xargs -0 stat "${UT_STAT[@]}" 2>/dev/null ) | sed 's/^/u|/'
+      if [[ "$UT_INCLUDE_IGNORED" == "true" ]]; then
+        ( cd "$root" && git ls-files -z --others --ignored --exclude-standard |
+          xargs -0 stat "${UT_STAT[@]}" 2>/dev/null ) | sed 's/^/i|/'
+      fi
+    } | sort -s -t'|' -k3,3 -nr
+  ) || true
+
+  local flag date epoch bytes path i ut_size ut_path ut_pad ut_marker cell style
+  local total=0 count=0 ignored=0
+
+  # Rows go straight into the table: collecting them in arrays first means
+  # walking every file twice, which is measurable at a few thousand files.
+  table_begin
+  table_add 'MODIFIED' "$(printf '%9s' 'SIZE')" 'FILE'
+
+  while IFS='|' read -r flag date epoch bytes path; do
+    if [[ -z "${path-}" ]]; then
+      continue
+    fi
+
+    _ut_human_bytes_into ut_size "$bytes"
+    printf -v ut_pad '%9s' "$ut_size"
+    relpath_into ut_path "${root}/${path}"
+
+    cell="$ut_path"
+    style=''
+    if [[ "$flag" == 'i' ]]; then
+      paint_into ut_marker "$C_YELLOW" '  (ignored)'
+      cell="${cell}${ut_marker}"
+      style="$C_DIM"
+    fi
+
+    table_add_styled "$style" "${date:0:16}" "$ut_pad" "$cell"
+    total=$(( total + bytes ))
+    count=$(( count + 1 ))
+    if [[ "$flag" == 'i' ]]; then
+      ignored=$(( ignored + 1 ))
+    fi
+  done <<<"$listing"
+
+  if [[ "$UT_INCLUDE_IGNORED" == "true" ]]; then
+    section 'Untracked and ignored files'
+  else
+    section 'Untracked files'
+  fi
+
+  if (( count == 0 )); then
+    printf '\n'
+    if [[ "$UT_INCLUDE_IGNORED" == "true" ]]; then
+      muted 'Nothing untracked and nothing ignored.'
+    else
+      muted 'No untracked files.'
+    fi
+    printf '\n'
+    return 0
+  fi
+
+  table_flush
+
+  printf '\n'
+  if (( ignored > 0 )); then
+    kv 'Files' "$(_plural "$count" '1 file' "${count} files"), ${ignored} ignored"
+  else
+    kv 'Files' "$(_plural "$count" '1 file' "${count} files")"
+  fi
+  kv 'Total' "$(paint "$C_BOLD" "$(_ut_human_bytes "$total")")"
+  printf '\n'
 }
 
 # ── Commands ────────────────────────────────────────────────────────────────
@@ -1766,6 +1987,7 @@ Commands:
   help                Show this help
   version             Show the version
   branches            List local branches with their state
+  untracked           List untracked files with size and age
   gc                  Reclaim space in the repository
   worktree, wt        List worktrees and open or create one for a branch
 
@@ -1808,6 +2030,9 @@ run_cmd() {
       ;;
     branches)
       cmd_branches "$@"
+      ;;
+    untracked)
+      cmd_untracked "$@"
       ;;
     -*)
       err "unknown option: ${cmd}"

@@ -26,11 +26,46 @@ g version
 | `g help` | Show usage |
 | `g version` | Show the version |
 | `g branches` | List local branches with their state |
+| `g untracked` | List untracked files with size and age |
 | `g gc` | Reclaim space in the repository |
 | `g worktree`, `g wt` | List worktrees and open or create one for a branch |
 
 Utilities from `~/bitbucket/pftylr/utils/git` are ported one at a time; each
 one appears in `g help` and in the table above as it lands.
+
+## `g untracked`
+
+Untracked files by age and size — ported from the `git-untracked` script in
+`~/bitbucket/pftylr/utils/git`.
+
+```bash
+g untracked        # untracked files, newest first
+g untracked -a     # include ignored files, each marked (ignored)
+```
+
+```
+Untracked and ignored files
+───────────────────────────
+MODIFIED               SIZE  FILE
+────────────────  ---------  ─────────────────────────────
+2026-10-24 15:02    1.9 MiB  build/huge.bin  (ignored)
+2026-10-24 15:01        2 B  src/a.txt
+2026-10-24 14:59    4.8 KiB  logs/run.log  (ignored)
+
+Files            3 files, 2 ignored
+Total            1.9 MiB
+```
+
+The list covers the whole repository, newest first, with ties holding
+alphabetical order so repeat runs agree. Paths are shown relative to the
+directory you run it from — the original stripped the repository root, which
+printed full paths whenever you were in a subdirectory. Ignored files are dim
+with a yellow `(ignored)` marker, and sizes use the same KiB/MiB/GiB units as
+`g gc`.
+
+Timestamps and sizes come from one batched `stat` rather than two processes per
+file: 2,000 untracked files list in about three seconds, against twenty for the
+per-file version.
 
 ## `g branches`
 
