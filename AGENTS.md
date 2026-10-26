@@ -43,6 +43,7 @@ bash -n g                     # syntax check
 | `g` | The tool: presentation layer, guards, dispatch, sub-commands. |
 | `install.sh` | Idempotent installer; symlinks `g` into `~/bin` by default. |
 | `README.md` | User-facing documentation. |
+| `logo.svg` | The mark shown at the top of the README; hand-written, no fonts, 128x128. |
 | `AGENTS.md` | This file. |
 | `LICENSE` | MIT. |
 | `.gitignore` | Ignored local artefacts, grouped by reason. |

@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo.svg" alt="g" width="112">
+</p>
+
 # g — git utilities
 
 `g` is a single command that wraps everyday git operations so they are quicker
