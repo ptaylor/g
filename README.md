@@ -32,6 +32,7 @@ g version
 | `g branches` | List local branches with their state |
 | `g branch-summary` | Summarise the current branch against its base |
 | `g grep` | `git grep` here, or across every indexed repository |
+| `g repos` | List the repositories g has been run in |
 | `g untracked` | List untracked files with size and age |
 | `g gc` | Reclaim space in the repository |
 | `g worktree`, `g wt` | List worktrees and open or create one for a branch |
@@ -113,6 +114,48 @@ Two consequences worth knowing: `--root DIR` writes `DIR/.g-repos`; and if you
 first run `g grep` from inside a repository that has no index above it, the file
 it creates is untracked — add `.g-repos` to `.gitignore`, or run from the parent
 directory.
+
+## `g repos`
+
+Every g command run from inside a repository records it, so the list builds
+itself as you work.
+
+```bash
+g repos            # everything g has been run in
+g repos fin        # only paths containing "fin", ignoring case
+g repos --clear    # forget them all
+```
+
+```
+Repositories
+────────────
+REPO         PATH                                   NOTE
+───────────  ─────────────────────────────────────  -------
+ClientApi    /Users/paul/work/ClientApi
+finsean      /Users/paul/github/pftylr/finsean
+g            /Users/paul/github/pftylr/g             current
+other        /Users/paul/oss/other                  missing
+
+Repositories     4
+Missing          1
+```
+
+The match is a case-insensitive substring of the whole path, so `g repos fin`
+and `g repos pftylr/fin` both work, and the table is sorted by repository name
+rather than by path.
+
+The cache is `~/.cache/g/repos` — `XDG_CACHE_HOME` is honoured and
+`G_CACHE_DIR` overrides both. It is one absolute path per line, deduplicated as
+it is written and sorted when read, so it can be edited by hand. Recording is
+best effort: an unwritable cache directory never stops a command, and
+`g help` and `g version` do not record.
+
+`g repos --clear` deletes the cache and reports how many entries it held. It
+does not ask first: the list is only a record of use, and it fills itself in
+again the next time you run something.
+
+Entries whose directory has gone are shown as `missing` rather than dropped, in
+case the path is on an unmounted volume.
 
 ## `g untracked`
 

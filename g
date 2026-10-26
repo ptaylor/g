@@ -2282,6 +2282,229 @@ cmd_grep() {
   printf '\n'
 }
 
+# ── repo cache ──────────────────────────────────────────────────────────────
+# Every run of g from inside a repository records it, so `g repos` can list the
+# places this tool has been used. The cache is a plain sorted-on-read list of
+# absolute paths; writing it is best effort and never speaks.
+
+_cache_dir() {
+  if [[ -n "${G_CACHE_DIR-}" ]]; then
+    printf '%s\n' "$G_CACHE_DIR"
+    return 0
+  fi
+  printf '%s/g\n' "${XDG_CACHE_HOME:-${HOME:?HOME is not set}/.cache}"
+}
+
+_repos_cache_file() {
+  printf '%s/repos\n' "$(_cache_dir)"
+}
+
+# Record the repository this command is running in. Silent, and never fatal:
+# a read-only HOME must not stop `g wt` from working.
+_cache_current_repo() {
+  local top cache
+
+  top=$(git rev-parse --show-toplevel 2>/dev/null) || return 0
+  if [[ -z "$top" ]]; then
+    return 0
+  fi
+
+  cache=$(_repos_cache_file)
+  if [[ -f "$cache" ]] && grep -qxF -e "$top" "$cache" 2>/dev/null; then
+    return 0
+  fi
+
+  if [[ ! -d "$(_cache_dir)" ]]; then
+    mkdir -p "$(_cache_dir)" 2>/dev/null || return 0
+  fi
+  printf '%s\n' "$top" >>"$cache" 2>/dev/null || return 0
+  return 0
+}
+
+# Read paths on stdin and emit "name<TAB>path", so the table can be sorted by
+# the name it shows rather than by the path behind it.
+_repos_named() {
+  local path name
+  while IFS= read -r path; do
+    if [[ -z "$path" ]]; then
+      continue
+    fi
+    name="${path##*/}"
+    printf '%s\t%s\n' "$name" "$path"
+  done
+}
+
+# Forget every cached repository. Nothing here is worth a confirmation: the list
+# exists to be rebuilt as you work, so clearing it loses nothing but the record.
+_repos_clear() {
+  local cache cleared=0
+  cache=$(_repos_cache_file)
+
+  if [[ -f "$cache" ]]; then
+    cleared=$(grep -c '^.' "$cache" 2>/dev/null) || cleared=0
+  fi
+
+  if (( cleared == 0 )); then
+    rm -f "$cache" 2>/dev/null || true
+    section 'Repo cache'
+    printf '\n'
+    muted 'Nothing cached yet — run a g command inside a repository.'
+    printf '\n'
+    return 0
+  fi
+
+  if ! rm -f "$cache" 2>/dev/null; then
+    die "could not remove ${cache}"
+  fi
+
+  section 'Repo cache'
+  printf '\n'
+  step "Cleared $(_plural "$cleared" '1 repository' "${cleared} repositories")"
+  printf '\n'
+  kv 'Cache' "$cache"
+  printf '\n'
+  muted 'The list fills itself in again as you use g.'
+  printf '\n'
+}
+
+repos_usage() {
+  section "g repos — where g has been used"
+
+  cat <<'EOF'
+Usage:
+  g repos [PATTERN]
+  g repos --clear
+
+Lists the repositories g has been run in. Every g command run from inside a
+repository records it, so the list builds itself as you work.
+
+PATTERN is matched against the whole path, ignoring case, so both `g repos fin`
+and `g repos pftylr/fin` work.
+
+--clear forgets every cached entry. The list fills itself in again as you use
+g, so nothing is lost and no confirmation is asked for.
+
+Cached entries whose directory has gone are shown as `missing` rather than
+dropped, in case the path is on an unmounted volume.
+
+Environment:
+  G_CACHE_DIR         Where the cache lives; default ~/.cache/g
+                      (XDG_CACHE_HOME is honoured)
+EOF
+
+  printf '\n'
+}
+
+cmd_repos() {
+  local pattern=''
+  local clear=false
+
+  while (( $# )); do
+    case "$1" in
+      -h|--help)
+        repos_usage
+        return 0
+        ;;
+      --clear)
+        if [[ -n "$pattern" ]]; then
+          die 'usage: g repos [--clear] [PATTERN]'
+        fi
+        clear=true
+        shift
+        ;;
+      -*)
+        die "unknown option: $1"
+        ;;
+      *)
+        if [[ -n "$pattern" || "$clear" == true ]]; then
+          die 'usage: g repos [--clear] [PATTERN]'
+        fi
+        pattern="$1"
+        shift
+        ;;
+    esac
+  done
+
+  if [[ "$clear" == true ]]; then
+    _repos_clear
+    return 0
+  fi
+
+  local cache
+  cache=$(_repos_cache_file)
+
+  if [[ ! -f "$cache" ]]; then
+    info 'no repositories cached yet — run a g command inside one'
+    printf '\n'
+    return 0
+  fi
+
+  local total
+  total=$(wc -l <"$cache" | tr -d ' ')
+
+  local line name
+  local -a repos=()
+  while IFS=$'\t' read -r name line; do
+    if [[ -n "$line" ]]; then
+      repos[${#repos[@]}]="$line"
+    fi
+  done < <(
+    if [[ -n "$pattern" ]]; then
+      grep -iF -e "$pattern" "$cache" 2>/dev/null
+    else
+      cat "$cache" 2>/dev/null
+    fi |
+      _repos_named | sort -f
+  )
+
+  local current=''
+  current=$(git rev-parse --show-toplevel 2>/dev/null) || current=''
+
+  section 'Repositories'
+
+  local n=${#repos[@]}
+  if (( n == 0 )); then
+    printf '\n'
+    muted "No repository matches '${pattern}'."
+    printf '\n'
+    return 0
+  fi
+
+  local i note style missing=0
+  table_begin
+  table_add 'REPO' 'PATH' 'NOTE'
+  for (( i = 0; i < n; i++ )); do
+    line="${repos[$i]}"
+    name="${line##*/}"
+    note=''
+    style=''
+
+    if [[ ! -d "$line" ]]; then
+      note='missing'
+      style="$C_RED"
+      missing=$(( missing + 1 ))
+    fi
+    if [[ -n "$current" && "$line" == "$current" ]]; then
+      note="${note:+$note, }current"
+      style="$C_CYAN"
+    fi
+
+    table_add_styled "$style" "$name" "$line" "$note"
+  done
+  table_flush
+
+  printf '\n'
+  if [[ -n "$pattern" ]]; then
+    kv 'Matching' "$n of $(_plural "$total" '1 repository' "${total} repositories")"
+  else
+    kv 'Repositories' "$n"
+  fi
+  if (( missing > 0 )); then
+    kv 'Missing' "$missing"
+  fi
+  printf '\n'
+}
+
 # ── Commands ────────────────────────────────────────────────────────────────
 
 cmd_version() {
@@ -2642,6 +2865,7 @@ Commands:
   branches            List local branches with their state
   branch-summary      Summarise the current branch against its base
   grep                git grep here, or across every indexed repository
+  repos               List the repositories g has been run in
   untracked           List untracked files with size and age
   gc                  Reclaim space in the repository
   worktree, wt        List worktrees and open or create one for a branch
@@ -2692,6 +2916,9 @@ run_cmd() {
     grep)
       cmd_grep "$@"
       ;;
+    repos)
+      cmd_repos "$@"
+      ;;
     untracked)
       cmd_untracked "$@"
       ;;
@@ -2732,6 +2959,25 @@ main() {
   esac
 
   _init_style "$colour"
+
+  # Remember where we were run from, before any command decides to exec — but
+  # not for `repos --clear`, which would put the current repository straight
+  # back into the cache it is about to empty.
+  local record=true arg
+  case "${1-}" in
+    help|--help|-h|version|--version|-V) record=false ;;
+    repos)
+      for arg in "$@"; do
+        if [[ "$arg" == '--clear' ]]; then
+          record=false
+        fi
+      done
+      ;;
+  esac
+  if [[ "$record" == true ]]; then
+    _cache_current_repo
+  fi
+
   run_cmd "$@"
 }
 

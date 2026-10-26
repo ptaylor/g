@@ -13,7 +13,7 @@ is pleasant on a terminal and clean in a pipe.
 
 WIP. The dispatch skeleton, the presentation layer, and six ported commands —
 `worktree` (alias `wt`), `gc`, `branches`, `branch-summary`, `grep` and
-`untracked` are in place. Further commands are ported one at a time from
+`untracked` are in place, plus `repos`, which is new rather than a port. Further commands are ported one at a time from
 `~/bitbucket/pftylr/utils/git` and must not be assumed to exist until they
 appear in `g help`.
 
@@ -30,6 +30,7 @@ appear in `g help`.
 ./g branches                  # local branches with their state
 ./g branch-summary            # the current branch against its base
 ./g grep --list               # repositories in the cross-repo index
+./g repos                     # repositories g has been run in
 ./g untracked                 # untracked files with size and age
 ./g gc -n                     # what a cleanup would do, without doing it
 
