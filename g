@@ -1926,6 +1926,362 @@ cmd_branch_summary() {
   printf '\n'
 }
 
+# ── g grep ──────────────────────────────────────────────────────────────────
+# Ported from ~/bitbucket/pftylr/utils/git/git-grep-all, reshaped around the
+# two ways it gets used: inside a repository it is plain `git grep`; outside it
+# searches every repository in an index kept in a dotfile.
+#
+# The index is a list of absolute paths with a `# root:` header, and its age is
+# its mtime — no second metadata file to fall out of step. Each hit is prefixed
+# with the repository path, so a result line is still a path you can open from
+# where you are standing.
+
+GREP_CACHE_TTL=86400
+GREP_MAX_DEPTH=10
+GREP_CACHE_NAME='.g-repos'
+GREP_REPOS=()
+GREP_ROOT=''
+GREP_BUILT=''
+
+# The index belongs to the directory it sits in and lists the repositories
+# under that directory, so it is found the way .git and .editorconfig are: the
+# nearest ancestor wins, and if there is none it is created where you are.
+_grep_cache_path() {
+  local dir
+
+  if [[ -n "${G_REPOS_FILE-}" ]]; then
+    printf '%s\n' "$G_REPOS_FILE"
+    return 0
+  fi
+
+  dir=$(pwd -P)
+  while true; do
+    if [[ -f "$dir/$GREP_CACHE_NAME" ]]; then
+      printf '%s\n' "$dir/$GREP_CACHE_NAME"
+      return 0
+    fi
+    if [[ "$dir" == '/' ]]; then
+      break
+    fi
+    dir=$(dirname "$dir")
+  done
+
+  printf '%s/%s\n' "$(pwd -P)" "$GREP_CACHE_NAME"
+}
+
+_grep_mtime() {
+  local m=''
+  m=$(stat -f '%m' "$1" 2>/dev/null) || m=$(stat -c '%Y' "$1" 2>/dev/null) || m=''
+  printf '%s\n' "$m"
+}
+
+# _grep_age_seconds DURATION — 30m, 12h, 7d, or plain seconds.
+_grep_age_seconds() {
+  local v="$1" n=''
+  case "$v" in
+    *d) n="${v%d}" ;;
+    *h) n="${v%h}" ;;
+    *m) n="${v%m}" ;;
+    *s) n="${v%s}" ;;
+    *)  n="$v" ;;
+  esac
+  if [[ ! "$n" =~ ^[0-9]+$ ]]; then
+    return 1
+  fi
+  case "$v" in
+    *d) printf '%s\n' $(( n * 86400 )) ;;
+    *h) printf '%s\n' $(( n * 3600 )) ;;
+    *m) printf '%s\n' $(( n * 60 )) ;;
+    *)  printf '%s\n' "$n" ;;
+  esac
+}
+
+_grep_index_stale() {
+  local cache="$1" ttl="$2" mtime now
+  if [[ ! -f "$cache" ]]; then
+    return 0
+  fi
+  mtime=$(_grep_mtime "$cache")
+  if [[ -z "$mtime" ]]; then
+    return 0
+  fi
+  if (( ttl == 0 )); then
+    return 0
+  fi
+  now=$(date +%s)
+  (( now - mtime > ttl ))
+}
+
+_grep_build_index() {
+  local root="$1" cache="$2" tmp count cache_dir
+
+  if [[ ! -d "$root" ]]; then
+    die "not a directory: ${root}"
+  fi
+
+  # Physical paths: find reports what it was given, and relpath works from
+  # `pwd -P`, so an unresolved /tmp against /private/tmp would match nothing.
+  root=$(cd "$root" && pwd -P)
+
+  cache_dir=$(dirname "$cache")
+  if [[ ! -d "$cache_dir" ]]; then
+    mkdir -p "$cache_dir" || die "cannot create ${cache_dir}"
+  fi
+
+  info "indexing repositories under ${root}, up to ${GREP_MAX_DEPTH} levels deep"
+
+  tmp="${cache}.$$"
+  if ! {
+    printf '# root: %s\n' "$root"
+    printf '# built: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+    find "$root" -maxdepth "$GREP_MAX_DEPTH" -name .git -prune -print 2>/dev/null |
+      while IFS= read -r g; do
+        dirname "$g"
+      done | sort
+  } >"$tmp"; then
+    rm -f "$tmp"
+    die "could not write the index"
+  fi
+
+  mv "$tmp" "$cache" || {
+    rm -f "$tmp"
+    die "cannot write ${cache}"
+  }
+
+  count=$(grep -c -v '^#' "$cache" || true)
+  info "found $(_plural "$count" '1 repository' "${count} repositories"), cached in ${cache}"
+}
+
+_grep_load_index() {
+  local line
+  GREP_REPOS=()
+  GREP_ROOT=''
+  GREP_BUILT=''
+  while IFS= read -r line; do
+    case "$line" in
+      '# root: '*)  GREP_ROOT="${line#\# root: }" ;;
+      '# built: '*) GREP_BUILT="${line#\# built: }" ;;
+      ''|'#'*)      continue ;;
+      *)
+        if [[ -d "$line" ]]; then
+          GREP_REPOS[${#GREP_REPOS[@]}]="$line"
+        fi
+        ;;
+    esac
+  done <"$1"
+}
+
+_grep_has_colour_flag() {
+  local a
+  for a in "$@"; do
+    case "$a" in
+      --color|--color=*|--no-color) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+grep_usage() {
+  section "g grep — search one repository, or all of them"
+
+  cat <<'EOF'
+Usage:
+  g grep [git-grep-options] PATTERN [--] [PATHSPEC...]
+  g grep --refresh [options] PATTERN   rebuild the index, then search
+  g grep --list                        show the indexed repositories
+
+Inside a repository this is `git grep`, with every option passed straight
+through, so -i, -n, -l, -w, -E and the rest behave exactly as you expect and
+colours are git's own.
+
+Outside a repository it searches every repository in the index, printing the
+repository and its branch above each block of hits, and prefixing every hit
+with the repository path so the result can be opened from here.
+
+Options:
+  --refresh           Rebuild the index before searching
+  --max-age WHEN      Rebuild if the index is older than WHEN (30m, 12h, 7d,
+                      or seconds). Default 1d
+  --root DIR          Use DIR's index (DIR/.g-repos), building it if needed
+  --all               Search every indexed repository even when inside one
+  --list              Print the indexed repositories and exit
+  --help              Show this help
+
+Environment:
+  G_REPOS_FILE        Use this index file instead of ./.g-repos
+
+The index is `.g-repos` in the directory it describes, found by walking up from
+where you are — so the one in ~/github covers every repository under ~/github,
+from whatever subdirectory you run in. It is a plain list of paths, one per
+line, so it can be edited by hand.
+EOF
+
+  printf '\n'
+}
+
+cmd_grep() {
+  local refresh=false list_only=false all=false max_age="$GREP_CACHE_TTL" root=''
+  local -a grep_args=()
+  local -a search_args=()
+  local in_repo=false cache scan_root
+
+  while (( $# )); do
+    case "$1" in
+      --help)
+        grep_usage
+        return 0
+        ;;
+      --refresh)  refresh=true;   shift ;;
+      --list)     list_only=true; shift ;;
+      --all)      all=true;       shift ;;
+      --root)
+        if [[ -z "${2-}" ]]; then
+          die '--root needs a directory'
+        fi
+        root="$2"
+        shift 2
+        ;;
+      --root=*)
+        root="${1#*=}"
+        shift
+        ;;
+      --max-age)
+        if [[ -z "${2-}" ]]; then
+          die '--max-age needs a duration, for example 12h or 7d'
+        fi
+        max_age=$(_grep_age_seconds "$2") || die "not a duration: $2"
+        shift 2
+        ;;
+      --max-age=*)
+        max_age=$(_grep_age_seconds "${1#*=}") || die "not a duration: ${1#*=}"
+        shift
+        ;;
+      --)
+        shift
+        while (( $# )); do
+          grep_args[${#grep_args[@]}]="$1"
+          shift
+        done
+        ;;
+      *)
+        grep_args[${#grep_args[@]}]="$1"
+        shift
+        ;;
+    esac
+  done
+
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    in_repo=true
+  fi
+
+  # The common case: inside a repository, nothing of ours to do.
+  if [[ "$in_repo" == "true" && "$refresh" == "false" && "$list_only" == "false" &&
+    "$all" == "false" && -z "$root" ]]; then
+    if (( ${#grep_args[@]} )); then
+      exec git grep "${grep_args[@]}"
+    fi
+    exec git grep
+  fi
+
+  # The index describes the directory it lives in: an index at ~/github/.g-repos
+  # covers ~/github, whichever subdirectory you are standing in when you use it.
+  if [[ -n "$root" ]]; then
+    if [[ ! -d "$root" ]]; then
+      die "not a directory: ${root}"
+    fi
+    root=$(cd "$root" && pwd -P)
+    cache="${root}/${GREP_CACHE_NAME}"
+    scan_root="$root"
+  else
+    cache=$(_grep_cache_path)
+    if [[ -n "${G_REPOS_FILE-}" ]]; then
+      scan_root=$(pwd -P)
+    else
+      scan_root=$(dirname "$cache")
+    fi
+  fi
+
+  # --root names the tree to index, so it always rebuilds.
+  if [[ "$refresh" == "true" || -n "$root" ]] ||
+    _grep_index_stale "$cache" "$max_age"; then
+    _grep_build_index "$scan_root" "$cache"
+  fi
+
+  _grep_load_index "$cache"
+
+  local n=${#GREP_REPOS[@]}
+  if (( n == 0 )); then
+    info "no repositories in ${cache}"
+    printf '\n'
+    return 1
+  fi
+
+  if [[ "$list_only" == "true" ]]; then
+    local i rp
+    section 'Indexed repositories'
+    kv 'Index' "$cache"
+    if [[ -n "$GREP_ROOT" ]]; then
+      kv 'Root' "$GREP_ROOT"
+    fi
+    if [[ -n "$GREP_BUILT" ]]; then
+      kv 'Built' "$GREP_BUILT"
+    fi
+    kv 'Repositories' "$n"
+    printf '\n'
+    for (( i = 0; i < n; i++ )); do
+      relpath_into rp "${GREP_REPOS[$i]}"
+      item "$C_DIM" '-' "$rp"
+    done
+    printf '\n'
+    return 0
+  fi
+
+  if (( ${#grep_args[@]} == 0 )); then
+    die 'usage: g grep [options] PATTERN'
+  fi
+
+  if (( G_COLOR )) && ! _grep_has_colour_flag "${grep_args[@]}"; then
+    search_args[${#search_args[@]}]='--color=always'
+  fi
+  local k
+  for (( k = 0; k < ${#grep_args[@]}; k++ )); do
+    search_args[${#search_args[@]}]="${grep_args[$k]}"
+  done
+
+  info "searching ${n} $(_plural "$n" 'repository' 'repositories')"
+
+  local i repo rel branch out rc line total=0 hit_repos=0
+  for (( i = 0; i < n; i++ )); do
+    repo="${GREP_REPOS[$i]}"
+    rc=0
+    out=$(git -C "$repo" grep "${search_args[@]}" 2>/dev/null) || rc=$?
+    if (( rc != 0 )) || [[ -z "$out" ]]; then
+      continue
+    fi
+
+    relpath_into rel "$repo"
+    branch=$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null) || branch='?'
+    printf '\n%s%s%s %s(%s)%s\n' "$C_BOLD" "$rel" "$C_RESET" "$C_DIM" "$branch" "$C_RESET"
+    while IFS= read -r line; do
+      printf '%s/%s\n' "$rel" "$line"
+    done <<<"$out"
+
+    while IFS= read -r line; do
+      total=$(( total + 1 ))
+    done <<<"$out"
+    hit_repos=$(( hit_repos + 1 ))
+  done
+
+  printf '\n'
+  if (( total == 0 )); then
+    muted "No matches in $(_plural "$n" '1 repository' "${n} repositories")."
+    printf '\n'
+    return 1
+  fi
+  muted "${total} $(_plural "$total" match matches) in ${hit_repos} of $(_plural "$n" '1 repository' "${n} repositories")."
+  printf '\n'
+}
+
 # ── Commands ────────────────────────────────────────────────────────────────
 
 cmd_version() {
@@ -2285,6 +2641,7 @@ Commands:
   version             Show the version
   branches            List local branches with their state
   branch-summary      Summarise the current branch against its base
+  grep                git grep here, or across every indexed repository
   untracked           List untracked files with size and age
   gc                  Reclaim space in the repository
   worktree, wt        List worktrees and open or create one for a branch
@@ -2331,6 +2688,9 @@ run_cmd() {
       ;;
     branch-summary)
       cmd_branch_summary "$@"
+      ;;
+    grep)
+      cmd_grep "$@"
       ;;
     untracked)
       cmd_untracked "$@"

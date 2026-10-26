@@ -31,12 +31,88 @@ g version
 | `g version` | Show the version |
 | `g branches` | List local branches with their state |
 | `g branch-summary` | Summarise the current branch against its base |
+| `g grep` | `git grep` here, or across every indexed repository |
 | `g untracked` | List untracked files with size and age |
 | `g gc` | Reclaim space in the repository |
 | `g worktree`, `g wt` | List worktrees and open or create one for a branch |
 
 Utilities from `~/bitbucket/pftylr/utils/git` are ported one at a time; each
 one appears in `g help` and in the table above as it lands.
+
+## `g grep`
+
+Search one repository, or all of them — ported from the `git-grep-all` script
+in `~/bitbucket/pftylr/utils/git`.
+
+**Inside a repository** it is `git grep`, with every option passed straight
+through, so `-i`, `-n`, `-l`, `-w`, `-E`, `--` and pathspecs behave exactly as
+git's, colours included:
+
+```bash
+g grep -n TODO src/          # git grep, unchanged
+```
+
+**Outside a repository** it searches every repository in an index, naming each
+repository and its branch, and prefixing each hit with the repository path so
+the result is still something you can open from where you are:
+
+```bash
+g grep quick
+```
+
+```
+alpha (main)
+alpha/content.txt:the quick brown fox
+
+gamma/deep (main)
+gamma/deep/content.txt:quick silver fox
+
+3 matches in 3 of 4 repositories.
+```
+
+| Option | Meaning |
+| --- | --- |
+| `--refresh` | Rebuild the index before searching |
+| `--max-age WHEN` | Rebuild if the index is older than `30m`, `12h`, `7d` or a number of seconds; default `1d` |
+| `--root DIR` | Index `DIR` instead of the current directory |
+| `--all` | Search every indexed repository even when inside one |
+| `--list` | Show the indexed repositories and exit |
+
+### The index and its root
+
+The index is `.g-repos` in the directory it describes, found the way `.git` is
+found — nearest ancestor first:
+
+```
+~/github/.g-repos        lists the repositories under ~/github
+~/github/g/              a repository; uses the index above
+```
+
+It is a plain list of absolute paths, one per line, behind two `#` header lines
+recording the root it was built from and when. Its mtime *is* its age, so there
+is no second file to fall out of step, and it can be edited by hand.
+
+| Situation | Index | Scanned |
+| --- | --- | --- |
+| No `.g-repos` here or above | created here | the current directory |
+| Found here or above | that file | only when stale: the directory holding it |
+| `--refresh` | as above | as above |
+| `--root DIR` | `DIR/.g-repos` | `DIR` |
+| `G_REPOS_FILE=FILE` | `FILE` | the current directory |
+
+Repositories are found with `find` from the scanned directory to a maximum
+depth of 10, never descending into a `.git`.
+
+Because the index lives with the tree it describes, a rebuild cannot narrow it
+by accident: `--refresh` from inside `~/github/g` rebuilds `~/github/.g-repos`
+by scanning `~/github`, and `--all` from inside that repository searches all of
+them. `g grep --list` prints the `Index`, `Root` and `Built` in force, so there
+is never a question of which file answered.
+
+Two consequences worth knowing: `--root DIR` writes `DIR/.g-repos`; and if you
+first run `g grep` from inside a repository that has no index above it, the file
+it creates is untracked — add `.g-repos` to `.gitignore`, or run from the parent
+directory.
 
 ## `g untracked`
 

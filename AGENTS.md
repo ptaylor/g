@@ -11,11 +11,11 @@ is pleasant on a terminal and clean in a pipe.
 
 ## Status
 
-WIP. The dispatch skeleton, the presentation layer, and five ported commands —
-`worktree` (alias `wt`), `gc`, `branches`, `branch-summary` and `untracked` — are
-in place. Further commands
-are ported one at a time from `~/bitbucket/pftylr/utils/git` and must not be
-assumed to exist until they appear in `g help`.
+WIP. The dispatch skeleton, the presentation layer, and six ported commands —
+`worktree` (alias `wt`), `gc`, `branches`, `branch-summary`, `grep` and
+`untracked` are in place. Further commands are ported one at a time from
+`~/bitbucket/pftylr/utils/git` and must not be assumed to exist until they
+appear in `g help`.
 
 ## Commands
 
@@ -29,6 +29,7 @@ assumed to exist until they appear in `g help`.
 ./g wt -s                     # worktree status report
 ./g branches                  # local branches with their state
 ./g branch-summary            # the current branch against its base
+./g grep --list               # repositories in the cross-repo index
 ./g untracked                 # untracked files with size and age
 ./g gc -n                     # what a cleanup would do, without doing it
 
@@ -148,7 +149,9 @@ Rules:
   `g untracked` batches `stat`, marks ignored files and shows paths relative to
   the current directory rather than stripping the repository root;
   `g branch-summary` only accepts base branches HEAD already contains, so a
-  sibling sharing the fork point is not mis-named as the base.
+  sibling sharing the fork point is not mis-named as the base; `g grep` names
+  its index `.g-repos`, finds it the way `.git` is found rather than always in
+  the working directory, and drops the original's `tee grep.log`.
 - **Separate blocks, end with a blank line.** Human-facing output leaves a
   blank line between the result and the hints that follow it, between a prompt
   and whatever comes next, and at the very end. A blank line that only exists

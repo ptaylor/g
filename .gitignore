@@ -17,6 +17,10 @@
 .env.local
 *.local
 
+# g's cross-repository index: a regenerable cache, and it lands in whichever
+# directory g grep is first run from
+.g-repos
+
 # Logs, caches and temporary files
 *.log
 *.tmp
