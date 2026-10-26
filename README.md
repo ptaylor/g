@@ -30,6 +30,7 @@ g version
 | `g help` | Show usage |
 | `g version` | Show the version |
 | `g branches` | List local branches with their state |
+| `g branch-summary` | Summarise the current branch against its base |
 | `g untracked` | List untracked files with size and age |
 | `g gc` | Reclaim space in the repository |
 | `g worktree`, `g wt` | List worktrees and open or create one for a branch |
@@ -110,6 +111,52 @@ different question: whether the branch has been merged upstream.
 
 `-m` leaves out the base branch and the branch you are on, since neither can be
 deleted.
+
+## `g branch-summary`
+
+What the current branch is worth — ported from the `git-branch-summary` script
+in `~/bitbucket/pftylr/utils/git`.
+
+```bash
+g branch-summary            # against the detected base
+g branch-summary main       # against a named base
+g branch-summary -v         # include the commit log
+```
+
+```
+Branch summary
+──────────────
+Branch           feature/work
+Base             main
+Created          2026-10-26 (2 hours ago)
+Commits          5 (last 20 minutes ago)
+Authors          Other Person, Paul Taylor
+Changes          +1 added, ~1 modified, -1 deleted, >1 renamed
+Diff             4 files changed, 2 insertions(+), 1 deletion(-)
+
+Added
+  + fresh.txt
+
+Modified
+  ~ keep.txt
+
+Deleted
+  - old.txt
+
+Renamed
+  > orig.txt → renamed.txt
+```
+
+The base is the nearest ancestor branch: the one HEAD already contains that
+leaves the fewest commits behind. A branch created from another feature
+therefore reports that feature rather than `main`, and on a tie
+`main`/`master`/`develop` wins. The original took the nearest branch by commit
+distance without checking that HEAD contained it, so a sibling sharing the fork
+point could be named as the base — the right diff under the wrong label.
+
+A branch with no changes prints `No changes against <base>.`; names and counts
+come from one `git diff --name-status` pass, so renames appear as
+`old → new` rather than as an add plus a delete.
 
 ## `g gc`
 

@@ -242,6 +242,13 @@ muted() {
   printf '%s%s%s\n' "$C_DIM" "$*" "$C_RESET"
 }
 
+# item COLOUR MARKER TEXT — one bullet in a report, with a coloured marker.
+item() {
+  local colour="$1" marker="$2"
+  shift 2
+  printf '  %s%s%s %s\n' "$colour" "$marker" "$C_RESET" "$*"
+}
+
 # step TEXT — one completed step of a report, on stdout.
 step() {
   local glyph='+'
@@ -1629,6 +1636,296 @@ cmd_untracked() {
   printf '\n'
 }
 
+# ── g branch-summary ────────────────────────────────────────────────────────
+# Ported from ~/bitbucket/pftylr/utils/git/git-branch-summary.
+
+BS_VERBOSE=false
+
+# The nearest ancestor branch: the one that leaves the fewest commits behind.
+# Only branches HEAD already contains count — a sibling that shares our fork
+# point would produce the right diff under the wrong name — and on a tie a
+# well-known base branch wins over a feature branch.
+_bs_nearest_base() {
+  local current branch count rank best='' best_count=0 best_rank=9
+
+  current=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) || return 0
+
+  while IFS= read -r branch; do
+    if [[ -z "$branch" || "$branch" == "$current" ]]; then
+      continue
+    fi
+    if ! git merge-base --is-ancestor "$branch" HEAD 2>/dev/null; then
+      continue
+    fi
+    count=$(git rev-list --count "${branch}..HEAD" 2>/dev/null) || continue
+
+    rank=1
+    case "${branch#origin/}" in
+      main|master|develop) rank=0 ;;
+    esac
+
+    if [[ -z "$best" ]] || (( count < best_count )) ||
+      (( count == best_count && rank < best_rank )); then
+      best="$branch"
+      best_count=$count
+      best_rank=$rank
+    fi
+  done < <(git branch --format='%(refname:short)' 2>/dev/null)
+
+  printf '%s\n' "$best"
+}
+
+_bs_detect_base() {
+  local best
+  best=$(_bs_nearest_base)
+  if [[ -n "$best" ]]; then
+    printf '%s\n' "$best"
+    return 0
+  fi
+  base_ref
+}
+
+bs_usage() {
+  section "g branch-summary — one branch, against its base"
+
+  cat <<'EOF'
+Usage:
+  g branch-summary [options] [BASE]
+
+Summarises the current branch against BASE: how many commits it is ahead, who
+wrote them, when it started, and every file it adds, modifies, deletes or
+renames.
+
+Options:
+  -v, --verbose   List the commits as well
+  -h, --help      Show this help
+
+BASE defaults to the nearest ancestor branch — the one that leaves the fewest
+commits behind — falling back to main, master or develop, local before origin.
+EOF
+
+  printf '\n'
+}
+
+cmd_branch_summary() {
+  BS_VERBOSE=false
+
+  while (( $# )); do
+    case "$1" in
+      -h|--help)
+        bs_usage
+        return 0
+        ;;
+      -v|--verbose)
+        BS_VERBOSE=true
+        shift
+        ;;
+      -[!-]?*)
+        local flags="${1#-}"
+        local -a split=()
+        shift
+        while [[ -n "$flags" ]]; do
+          split[${#split[@]}]="-${flags:0:1}"
+          flags="${flags:1}"
+        done
+        set -- "${split[@]}" "$@"
+        ;;
+      -*)
+        die "unknown option: $1"
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+
+  if (( $# > 1 )); then
+    die 'usage: g branch-summary [-v] [BASE]'
+  fi
+
+  require_repo
+
+  local current base mb
+  current=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) ||
+    die 'cannot read the current branch'
+
+  if (( $# == 1 )); then
+    base="$1"
+    if ! git rev-parse --verify --quiet "$base" >/dev/null; then
+      die "no such branch: ${base}"
+    fi
+  else
+    base=$(_bs_detect_base)
+    if [[ -z "$base" ]]; then
+      die 'cannot detect a base branch; name one: g branch-summary BASE'
+    fi
+  fi
+
+  mb=$(git merge-base "$base" HEAD 2>/dev/null) ||
+    die "'${base}' and HEAD have no common ancestor"
+
+  local count first_line first_date first_rel last_rel stat
+  count=$(git rev-list --count "$mb"..HEAD 2>/dev/null) || count=0
+
+  first_line=''
+  first_line=$(git log --reverse --format='%ai|%ar' "$mb"..HEAD 2>/dev/null | head -1) || true
+  first_date=''
+  first_rel=''
+  if [[ -n "$first_line" ]]; then
+    first_date="${first_line%%|*}"
+    first_date="${first_date%% *}"
+    first_rel="${first_line#*|}"
+  fi
+
+  last_rel=''
+  last_rel=$(git log -1 --format='%ar' "$mb"..HEAD 2>/dev/null) || true
+
+  local -a authors=()
+  local a
+  while IFS= read -r a; do
+    if [[ -n "$a" ]]; then
+      authors[${#authors[@]}]="$a"
+    fi
+  done < <(git log --format='%aN' "$mb"..HEAD 2>/dev/null | sort -u)
+
+  stat=$(git diff --shortstat "$mb"..HEAD 2>/dev/null) || stat=''
+
+  # One pass over --name-status supplies both the counts and the file lists.
+  local -a added=()
+  local -a modified=()
+  local -a deleted=()
+  local -a renamed=()
+  local st p1 p2
+
+  while IFS=$'\t' read -r st p1 p2; do
+    if [[ -z "${st-}" ]]; then
+      continue
+    fi
+    case "${st:0:1}" in
+      A) added[${#added[@]}]="$p1" ;;
+      D) deleted[${#deleted[@]}]="$p1" ;;
+      R)
+        if (( G_UNICODE )); then
+          renamed[${#renamed[@]}]="${p1} → ${p2-}"
+        else
+          renamed[${#renamed[@]}]="${p1} -> ${p2-}"
+        fi
+        ;;
+      *) modified[${#modified[@]}]="$p1" ;;
+    esac
+  done < <(git diff --name-status "$mb"..HEAD 2>/dev/null || true)
+
+  local n_added=${#added[@]} n_modified=${#modified[@]}
+  local n_deleted=${#deleted[@]} n_renamed=${#renamed[@]}
+  local total=$(( n_added + n_modified + n_deleted + n_renamed ))
+  local i joined='' changes pig
+
+  section 'Branch summary'
+
+  if [[ "$current" == 'HEAD' ]]; then
+    kv 'Branch' '(detached HEAD)'
+  else
+    kv 'Branch' "$(paint "$C_BOLD" "$current")"
+  fi
+  kv 'Base' "$base"
+
+  if [[ -n "$first_date" ]]; then
+    kv 'Created' "${first_date} (${first_rel})"
+  fi
+  if (( count > 0 )); then
+    kv 'Commits' "${count} (last ${last_rel})"
+  else
+    kv 'Commits' 'none'
+  fi
+
+  if (( ${#authors[@]} == 1 )); then
+    kv 'Author' "${authors[0]}"
+  elif (( ${#authors[@]} > 1 )); then
+    joined=''
+    for (( i = 0; i < ${#authors[@]}; i++ )); do
+      if [[ -n "$joined" ]]; then
+        joined+=', '
+      fi
+      joined+="${authors[$i]}"
+    done
+    kv 'Authors' "$joined"
+  fi
+
+  if (( total > 0 )); then
+    changes=''
+    if (( n_added )); then
+      paint_into pig "$C_GREEN" "+${n_added} added"
+      changes+="$pig"
+    fi
+    if (( n_modified )); then
+      paint_into pig "$C_YELLOW" "~${n_modified} modified"
+      changes+="${changes:+, }$pig"
+    fi
+    if (( n_deleted )); then
+      paint_into pig "$C_RED" "-${n_deleted} deleted"
+      changes+="${changes:+, }$pig"
+    fi
+    if (( n_renamed )); then
+      paint_into pig "$C_CYAN" ">${n_renamed} renamed"
+      changes+="${changes:+, }$pig"
+    fi
+    kv 'Changes' "$changes"
+    if [[ -n "$stat" ]]; then
+      kv 'Diff' "$stat"
+    fi
+  fi
+
+  if (( total == 0 )); then
+    printf '\n'
+    muted "No changes against ${base}."
+    printf '\n'
+  else
+    if (( n_added )); then
+      printf '\n'
+      muted 'Added'
+      for (( i = 0; i < n_added; i++ )); do
+        item "$C_GREEN" '+' "${added[$i]}"
+      done
+    fi
+    if (( n_modified )); then
+      printf '\n'
+      muted 'Modified'
+      for (( i = 0; i < n_modified; i++ )); do
+        item "$C_YELLOW" '~' "${modified[$i]}"
+      done
+    fi
+    if (( n_deleted )); then
+      printf '\n'
+      muted 'Deleted'
+      for (( i = 0; i < n_deleted; i++ )); do
+        item "$C_RED" '-' "${deleted[$i]}"
+      done
+    fi
+    if (( n_renamed )); then
+      printf '\n'
+      muted 'Renamed'
+      for (( i = 0; i < n_renamed; i++ )); do
+        item "$C_CYAN" '>' "${renamed[$i]}"
+      done
+    fi
+  fi
+
+  if [[ "$BS_VERBOSE" == "true" ]] && (( count > 0 )); then
+    printf '\n'
+    muted 'Commit log'
+    local h s an ar
+    while IFS=$'\t' read -r h s an ar; do
+      if [[ -z "${h-}" ]]; then
+        continue
+      fi
+      printf '  %s%s%s  %s %s(%s, %s)%s\n' \
+        "$C_YELLOW" "$h" "$C_RESET" "$s" "$C_DIM" "$an" "$ar" "$C_RESET"
+    done < <(git log --format='%h%x09%s%x09%aN%x09%ar' "$mb"..HEAD 2>/dev/null || true)
+  fi
+
+  printf '\n'
+}
+
 # ── Commands ────────────────────────────────────────────────────────────────
 
 cmd_version() {
@@ -1987,6 +2284,7 @@ Commands:
   help                Show this help
   version             Show the version
   branches            List local branches with their state
+  branch-summary      Summarise the current branch against its base
   untracked           List untracked files with size and age
   gc                  Reclaim space in the repository
   worktree, wt        List worktrees and open or create one for a branch
@@ -2030,6 +2328,9 @@ run_cmd() {
       ;;
     branches)
       cmd_branches "$@"
+      ;;
+    branch-summary)
+      cmd_branch_summary "$@"
       ;;
     untracked)
       cmd_untracked "$@"
