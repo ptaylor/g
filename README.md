@@ -34,6 +34,7 @@ g version
 | `g grep` | `git grep` here, or across every indexed repository |
 | `g log` | The whole history, commit by commit |
 | `g branch-log` | The commits this branch adds, with their changes |
+| `g contributors`, `g who` | Who has written this repository, by number of commits |
 | `g repos` | List the repositories g has been run in |
 | `g untracked` | List untracked files with size and age |
 | `g gc` | Reclaim space in the repository |
@@ -42,11 +43,56 @@ g version
 Utilities from `~/bitbucket/pftylr/utils/git` are ported one at a time; each
 one appears in `g help` and in the table above as it lands.
 
+## `g contributors` (alias `g who`)
+
+Who has written this repository — ported from `git-commit-summary` in
+`~/bitbucket/pftylr/utils/git`. The original listed the distinct author strings
+on remote branches for the last few months, using macOS-only `date -v`, a whole
+log walk per branch, and a new row for every spelling of a name. This walks the
+whole history by default and groups by email, so one person is one row.
+
+```bash
+g contributors                # the whole history
+g contributors -s 18m         # the last eighteen months
+g contributors -s 2026-01-01  # ...or since a date
+g contributors -n 5           # just the five most prolific
+g contributors --all          # every reference, not only HEAD
+g who                         # the same command, if that comes to mind first
+```
+
+```
+Contributors
+────────────
+AUTHOR       COMMITS  FIRST       LAST        EMAIL
+───────────  ───────  ──────────  ──────────  ─────────────────
+Paul             187  2026-06-24  2026-08-10  paul@bogano.local
+Paul Taylor        7  2026-06-27  2026-09-25  pftylr@gmail.com
+
+History          HEAD
+Contributors     2
+Commits          194 (last 2026-09-25)
+```
+
+Rows are ordered by commit count with the most prolific in bold, and each shows
+the name that address used most often, the dates of its first and last commit,
+and the address itself. The two rows above are one person committing from two
+machines.
+
+**Identities.** Grouping is by email, because that is what identifies a person
+across machines — name spellings do not. When one address has been used under
+several names you get the commonest. A `.mailmap` settles the rest: git applies
+it to the author name and email, so `g contributors` follows it without knowing
+anything about it.
+
+`--since` takes `30d`, `6w`, `18m`, `2y` or a `YYYY-MM-DD` date. Anything else
+is refused rather than handed to git, which reads an unparseable date as "now"
+and would report a repository with no history.
+
 ## `g log`
 
-The whole history, in the blocks `g branch-log` prints — hash, subject, author,
-age, message and the files each commit changed. Nothing stops the walk at a
-base, so it runs back through the entire history.
+The whole history, in the blocks `g branch-log` prints — hash, subject,
+author, age, message and the files each commit changed. Nothing stops the walk
+at a base, so it runs back through the entire history.
 
 ```bash
 g log            # the last 20 commits

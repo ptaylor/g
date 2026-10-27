@@ -2419,6 +2419,234 @@ _log_main() {
   printf '\n'
 }
 
+# ── g contributors ──────────────────────────────────────────────────────────
+# Ported from ~/bitbucket/pftylr/utils/git/git-commit-summary, which listed the
+# distinct author strings on remote branches for the last N months: macOS-only
+# `date -v`, a whole log walk per ref, and the same person repeated once for
+# every spelling of their identity. Here one `git log` pass feeds an awk tally
+# keyed by email, so identities collapse and each person gets a row.
+
+CON_SINCE=''
+CON_TOP=0
+CON_ALL=false
+
+# _con_when ARG — Nd/Nw/Nm/Ny become git's own words; a plain ISO date is handed
+# over as it stands. Anything else is refused, because git reads an unparseable
+# --since as "now" and the result looks like a repository with no history.
+_con_when() {
+  local v="$1" n unit
+
+  n="${v%?}"
+  unit="${v: -1}"
+  if [[ "$n" =~ ^[0-9]+$ ]]; then
+    case "$unit" in
+      d) printf '%s days ago\n' "$n";   return 0 ;;
+      w) printf '%s weeks ago\n' "$n";  return 0 ;;
+      m) printf '%s months ago\n' "$n"; return 0 ;;
+      y) printf '%s years ago\n' "$n";  return 0 ;;
+    esac
+  fi
+  if [[ "$v" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+    printf '%s\n' "$v"
+    return 0
+  fi
+  return 1
+}
+
+con_usage() {
+  section "g contributors — who has written this repository"
+
+  cat <<'EOF'
+Usage:
+  g contributors [options]
+  g who [options]
+
+`g who` is the same command, for when the word comes to mind first.
+
+Tallies every commit by author across the whole history and lists the people by
+number of commits, with the date of their first and last one.
+
+People are grouped by email, so one person spelled three different ways is one
+row showing the name they used most — and .mailmap is honoured, so you can fix
+the rest by writing one.
+
+Options:
+  -s, --since WHEN   Only commits since WHEN: 30d, 6w, 18m, 2y or 2024-01-01
+  -n, --top N        Show only the N most prolific contributors
+  -a, --all          Walk every reference, not just HEAD
+  -h, --help         Show this help
+EOF
+
+  printf '\n'
+}
+
+cmd_contributors() {
+  CON_SINCE=''
+  CON_TOP=0
+  CON_ALL=false
+
+  while (( $# )); do
+    case "$1" in
+      -h|--help)
+        con_usage
+        return 0
+        ;;
+      -s|--since)
+        if (( $# < 2 )); then
+          die 'usage: g contributors [-n N] [-s WHEN] [--all]'
+        fi
+        CON_SINCE="$2"
+        shift 2
+        ;;
+      --since=*)
+        CON_SINCE="${1#*=}"
+        shift
+        ;;
+      -n|--top)
+        if (( $# < 2 )); then
+          die 'usage: g contributors [-n N] [-s WHEN] [--all]'
+        fi
+        CON_TOP="$2"
+        shift 2
+        ;;
+      --top=*)
+        CON_TOP="${1#*=}"
+        shift
+        ;;
+      -a|--all)
+        CON_ALL=true
+        shift
+        ;;
+      -[!-]?*)
+        local flags="${1#-}"
+        local -a split=()
+        shift
+        while [[ -n "$flags" ]]; do
+          split[${#split[@]}]="-${flags:0:1}"
+          flags="${flags:1}"
+        done
+        set -- "${split[@]}" "$@"
+        ;;
+      -*)
+        die "unknown option: $1"
+        ;;
+      *)
+        die 'usage: g contributors [-n N] [-s WHEN] [--all]'
+        ;;
+    esac
+  done
+
+  case "$CON_TOP" in
+    ''|*[!0-9]*) die "not a number of contributors: ${CON_TOP}" ;;
+  esac
+
+  require_repo
+
+  if ! git rev-parse --verify --quiet HEAD >/dev/null; then
+    die 'no commits yet — there is no one to count'
+  fi
+
+  local when_git=''
+  if [[ -n "$CON_SINCE" ]]; then
+    when_git=$(_con_when "$CON_SINCE") ||
+      die "not a duration or a date: ${CON_SINCE} (try 18m, 2y or 2024-01-01)"
+  fi
+
+  local -a log_args=(--format='%aE%x09%aN%x09%ad' --date=short)
+  if [[ "$CON_ALL" == "true" ]]; then
+    log_args+=(--all)
+  fi
+  if [[ -n "$when_git" ]]; then
+    log_args+=(--since="$when_git")
+  fi
+
+  local rows
+  rows=$(git log "${log_args[@]}" HEAD 2>/dev/null | awk -F'\t' '
+    NF >= 3 {
+      email = $1
+      name = $2
+      day = $3
+
+      if (!(email in commits)) {
+        commits[email] = 0
+        first[email] = day
+        last[email] = day
+      }
+      commits[email]++
+      if (day < first[email]) first[email] = day
+      if (day > last[email]) last[email] = day
+
+      key = email SUBSEP name
+      seen[key]++
+      if (seen[key] > best[email] ||
+          (seen[key] == best[email] && length(name) > length(bestname[email]))) {
+        best[email] = seen[key]
+        bestname[email] = name
+      }
+    }
+    END {
+      for (email in commits) {
+        printf "%s\t%s\t%d\t%s\t%s\n",
+          bestname[email], email, commits[email], first[email], last[email]
+      }
+    }
+  ' | sort -t $'\t' -k3,3nr -k1,1f -k2,2)
+
+  if [[ -z "$rows" ]]; then
+    section 'Contributors'
+    printf '\n'
+    muted 'No commits in that range.'
+    printf '\n'
+    return 0
+  fi
+
+  local name email count first last
+  local people=0 shown=0 total=0 newest=''
+
+  section 'Contributors'
+
+  table_begin
+  table_add 'AUTHOR' "$(printf '%7s' 'COMMITS')" 'FIRST' 'LAST' 'EMAIL'
+  while IFS=$'\t' read -r name email count first last; do
+    if [[ -z "$email" ]]; then
+      continue
+    fi
+    people=$(( people + 1 ))
+    total=$(( total + count ))
+    if [[ -z "$newest" || "$last" > "$newest" ]]; then
+      newest="$last"
+    fi
+    if (( CON_TOP > 0 && shown >= CON_TOP )); then
+      continue
+    fi
+    shown=$(( shown + 1 ))
+    if (( shown == 1 )); then
+      table_add_styled "$C_BOLD" \
+        "$name" "$(printf '%7d' "$count")" "$first" "$last" "$email"
+    else
+      table_add "$name" "$(printf '%7d' "$count")" "$first" "$last" "$email"
+    fi
+  done <<<"$rows"
+  table_flush
+
+  printf '\n'
+  if [[ "$CON_ALL" == "true" ]]; then
+    kv 'History' 'every reference'
+  else
+    kv 'History' 'HEAD'
+  fi
+  if [[ -n "$CON_SINCE" ]]; then
+    kv 'Since' "$CON_SINCE"
+  fi
+  if (( CON_TOP > 0 && shown < people )); then
+    kv 'Contributors' "${shown} of ${people}"
+  else
+    kv 'Contributors' "$people"
+  fi
+  kv 'Commits' "${total} (last ${newest})"
+  printf '\n'
+}
+
 # ── g grep ──────────────────────────────────────────────────────────────────
 # Ported from ~/bitbucket/pftylr/utils/git/git-grep-all, reshaped around the
 # two ways it gets used: inside a repository it is plain `git grep`; outside it
@@ -3358,6 +3586,7 @@ Commands:
   branches            List local branches with their state
   branch-summary      Summarise the current branch against its base
   branch-log          The commits this branch adds, with their changes
+  contributors, who   Who has written this repository, by number of commits
   grep                git grep here, or across every indexed repository
   log                 The whole history, commit by commit
   repos               List the repositories g has been run in
@@ -3416,6 +3645,9 @@ run_cmd() {
       ;;
     branch-log)
       cmd_branch_log "$@"
+      ;;
+    contributors|who)
+      cmd_contributors "$@"
       ;;
     repos)
       cmd_repos "$@"

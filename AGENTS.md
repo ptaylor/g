@@ -11,10 +11,10 @@ is pleasant on a terminal and clean in a pipe.
 
 ## Status
 
-WIP. The dispatch skeleton, the presentation layer, and seven ported commands —
-`worktree` (alias `wt`), `gc`, `branches`, `branch-summary`, `grep`, `log`,
-`branch-log` and `untracked` — are in place, plus `repos`, which is new rather
-than a port.
+WIP. The dispatch skeleton, the presentation layer, and the commands ported so
+far are in place: `worktree` (alias `wt`), `gc`, `branches`, `branch-summary`,
+`grep`, `log`, `branch-log`, `contributors` (alias `who`) and `untracked`, plus
+`repos`, which is new rather than a port.
 Further commands are ported one at a time from `~/bitbucket/pftylr/utils/git`
 and must not be assumed to exist until they appear in `g help`.
 
@@ -33,6 +33,7 @@ and must not be assumed to exist until they appear in `g help`.
 ./g grep --list               # repositories in the cross-repo index
 ./g log -n 3                  # the last three commits in the history
 ./g branch-log                # the commits this branch adds
+./g contributors -n 3         # the three busiest authors
 ./g repos                     # repositories g has been run in
 ./g untracked                 # untracked files with size and age
 ./g gc -n                     # what a cleanup would do, without doing it
