@@ -53,6 +53,7 @@ bash -n g                     # syntax check
 | `install.sh` | Idempotent installer; symlinks `g` into `~/bin` by default. |
 | `README.md` | User-facing documentation. |
 | `logo.svg` | The mark shown at the top of the README; hand-written, no fonts, 128x128. |
+| `IDEAS.md` | Working list of what to do next, with the reasoning. |
 | `AGENTS.md` | This file. |
 | `LICENSE` | MIT. |
 | `.gitignore` | Ignored local artefacts, grouped by reason. |
