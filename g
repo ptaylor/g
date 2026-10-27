@@ -1926,6 +1926,499 @@ cmd_branch_summary() {
   printf '\n'
 }
 
+# ── g log ───────────────────────────────────────────────────────────────────
+# Ported from ~/bitbucket/pftylr/utils/git/git-log, which printed
+# `git log MERGE_BASE..HEAD --name-status` and assumed origin/main was there.
+# The range is the same, but the base is discovered (see _log_detect_base), and
+# one machine-separated pass (%x1f between fields, %x1e at the start of each
+# commit) is enough to lay every commit out as its own block.
+
+LOG_STAT=false
+LOG_WANT_BODY=true
+LOG_LIMIT=0
+LOG_LIMIT_SET=false
+LOG_PRINTED=false
+LOG_H='' LOG_DATE='' LOG_WHEN='' LOG_NAME='' LOG_MAIL='' LOG_SUBJECT=''
+LOG_PARENTS=''
+LOG_FILES=()
+LOG_NUM=()
+LOG_TEXT=()
+
+# _log_header LINE — split a %x1f-separated commit header into the LOG_*
+# globals. `set --` does the splitting, which avoids the herestring — and so the
+# temporary file — that would otherwise be paid once per commit.
+_log_header() {
+  local save_ifs="$IFS"
+
+  IFS=$'\x1f'
+  set -f
+  # shellcheck disable=SC2086
+  set -- $1
+  set +f
+  IFS="$save_ifs"
+
+  LOG_H="${1-}"
+  LOG_DATE="${2-}"
+  LOG_WHEN="${3-}"
+  LOG_NAME="${4-}"
+  LOG_MAIL="${5-}"
+  LOG_SUBJECT="${6-}"
+  LOG_PARENTS="${7-}"
+}
+
+# _log_file LETTER PATHS — record one changed file. PATHS holds two tab-separated
+# paths when the change is a rename or a copy.
+_log_file() {
+  local letter="$1" paths="$2" arrow=' -> '
+
+  if (( G_UNICODE )); then
+    arrow=' → '
+  fi
+
+  case "${letter:0:1}" in
+    R|C) paths="${paths%%$'\t'*}${arrow}${paths#*$'\t'}" ;;
+  esac
+
+  LOG_FILES[${#LOG_FILES[@]}]="${letter:0:1}"$'\x1f'"${paths}"
+}
+
+_log_reset() {
+  LOG_H='' LOG_DATE='' LOG_WHEN='' LOG_NAME='' LOG_MAIL='' LOG_SUBJECT=''
+  LOG_PARENTS=''
+  LOG_FILES=()
+  LOG_NUM=()
+  LOG_TEXT=()
+}
+
+# _log_emit — print the commit sitting in the LOG_* globals.
+_log_emit() {
+  local pad i n letter path entry add del colour arrow=' -> '
+
+  if [[ -z "$LOG_H" ]]; then
+    return 0
+  fi
+
+  if [[ "$LOG_PRINTED" == true ]]; then
+    printf '\n'
+  fi
+  LOG_PRINTED=true
+
+  printf '  %s%s%s  %s%s%s\n' \
+    "$C_YELLOW" "$LOG_H" "$C_RESET" "$C_BOLD" "$LOG_SUBJECT" "$C_RESET"
+
+  printf -v pad '%*s' $(( ${#LOG_H} + 4 )) ''
+
+  # Git prints no file list for a merge, so say why the block is short.
+  local parents=1 rest_p="$LOG_PARENTS"
+  while [[ "$rest_p" == *' '* ]]; do
+    rest_p="${rest_p#* }"
+    parents=$(( parents + 1 ))
+  done
+
+  local extra=''
+  if (( parents > 1 )); then
+    extra=", merge of ${parents} parents"
+  fi
+
+  printf '%s%s%s  %s <%s>, %s%s%s\n' \
+    "$pad" "$C_DIM" "$LOG_DATE" "$LOG_NAME" "$LOG_MAIL" "$LOG_WHEN" "$extra"     "$C_RESET"
+
+  # Blank lines are only kept inside the body: leading and trailing ones are
+  # git's own spacing between the message and the file list.
+  local start=0 end=${#LOG_TEXT[@]}
+  while (( start < end )) && [[ -z "${LOG_TEXT[$start]}" ]]; do
+    start=$(( start + 1 ))
+  done
+  while (( end > start )) && [[ -z "${LOG_TEXT[$(( end - 1 ))]}" ]]; do
+    end=$(( end - 1 ))
+  done
+
+  if (( start < end )); then
+    printf '\n'
+    for (( i = start; i < end; i++ )); do
+      if [[ -n "${LOG_TEXT[$i]}" ]]; then
+        printf '%s%s\n' "$pad" "${LOG_TEXT[$i]}"
+      else
+        printf '\n'
+      fi
+    done
+  fi
+
+  n=${#LOG_FILES[@]}
+  if (( n > 0 )); then
+    if (( G_UNICODE )); then
+      arrow=' → '
+    fi
+    printf '\n'
+    for (( i = 0; i < n; i++ )); do
+      entry="${LOG_FILES[$i]}"
+      letter="${entry%%$'\x1f'*}"
+      path="${entry#*$'\x1f'}"
+
+      colour="$C_YELLOW"
+      case "$letter" in
+        A) colour="$C_GREEN" ;;
+        D) colour="$C_RED" ;;
+        R) colour="$C_CYAN" ;;
+      esac
+
+      if [[ "$LOG_STAT" == "true" ]] && (( i < ${#LOG_NUM[@]} )); then
+        entry="${LOG_NUM[$i]}"
+        add="${entry%%$'\x1f'*}"
+        del="${entry#*$'\x1f'}"
+        if [[ "$add" != '-' ]]; then
+          add="+${add}"
+        fi
+        if [[ "$del" != '-' ]]; then
+          del="-${del}"
+        fi
+        if [[ "$path" == *' => '* ]]; then
+          path="${path/ => /$arrow}"
+        fi
+        printf '%s%s%s%s  %4s %4s  %s\n' \
+          "$pad" "$colour" "$letter" "$C_RESET" "$add" "$del" "$path"
+      else
+        printf '%s%s%s%s  %s\n' "$pad" "$colour" "$letter" "$C_RESET" "$path"
+      fi
+    done
+  fi
+}
+
+# _log_detect_base — branch-summary's rule, with one difference: once a
+# well-known integration branch is behind HEAD, it wins outright. A sibling
+# branch merged back in is nearer by commit count and would make the range
+# "everything since that merge", which answers a question nobody asked.
+_log_detect_base() {
+  local b
+  for b in main origin/main master origin/master develop origin/develop; do
+    if git rev-parse --verify --quiet "$b" >/dev/null 2>&1 &&
+      git merge-base --is-ancestor "$b" HEAD 2>/dev/null; then
+      printf '%s\n' "$b"
+      return 0
+    fi
+  done
+  _bs_nearest_base
+}
+
+log_usage() {
+  section "g log — the whole history, one commit at a time"
+
+  cat <<'EOF'
+Usage:
+  g log [options]
+
+Lists the history of the current branch, newest first, in the same commit
+blocks g branch-log uses: hash, subject, author, age, message and changed
+files. Nothing stops the walk, so it runs back through the whole history,
+showing 20 commits unless -n says otherwise.
+
+Options:
+  -n, --limit N   Show at most N commits (0 for all of them; default 20)
+  -s, --stat      Add per-file added and removed line counts
+      --no-body   Leave out commit message bodies
+  -h, --help      Show this help
+
+For just the commits this branch adds, use g branch-log.
+EOF
+
+  printf '\n'
+}
+
+branch_log_usage() {
+  section "g branch-log — the commits this branch adds"
+
+  cat <<'EOF'
+Usage:
+  g branch-log [options] [BASE]
+
+Lists the commits on the current branch that BASE does not have, newest first,
+each with its author, age, message and the files it changed.
+
+Options:
+  -n, --limit N   Show at most N commits (default: all of them)
+  -s, --stat      Add per-file added and removed line counts
+      --no-body   Leave out commit message bodies
+  -h, --help      Show this help
+
+BASE defaults to main, master or develop when HEAD already contains one of
+them, local before origin, and otherwise to the nearest ancestor branch. On a
+base branch itself that leaves the commits you have not pushed yet.
+
+g branch-summary always takes the nearest ancestor; a sibling branch merged
+back in is nearer by commit count but makes a useless range. g log shows the
+whole history instead, in the same format.
+EOF
+
+  printf '\n'
+}
+
+cmd_log() {
+  _log_main history "$@"
+}
+
+cmd_branch_log() {
+  _log_main branch "$@"
+}
+
+# _log_main MODE [options] [BASE] — the one implementation behind both commands.
+# MODE is `branch` for the range up to the base, `history` for the whole of
+# HEAD; the range is settled first and everything after it is shared, so the two
+# commands cannot drift apart in either behaviour or formatting.
+_log_main() {
+  local mode="$1" usage_line='g log [-n N] [-s] [--no-body]'
+  shift
+
+  LOG_STAT=false
+  LOG_WANT_BODY=true
+  LOG_LIMIT=0
+  LOG_LIMIT_SET=false
+  local base_arg=''
+
+  if [[ "$mode" == "branch" ]]; then
+    usage_line='g branch-log [-n N] [-s] [--no-body] [BASE]'
+  fi
+
+  while (( $# )); do
+    case "$1" in
+      -h|--help)
+        if [[ "$mode" == "branch" ]]; then
+          branch_log_usage
+        else
+          log_usage
+        fi
+        return 0
+        ;;
+      -s|--stat)
+        LOG_STAT=true
+        shift
+        ;;
+      --no-body)
+        LOG_WANT_BODY=false
+        shift
+        ;;
+      -n|--limit)
+        if (( $# < 2 )); then
+          die "usage: ${usage_line}"
+        fi
+        LOG_LIMIT="$2"
+        LOG_LIMIT_SET=true
+        shift 2
+        ;;
+      -n?*)
+        LOG_LIMIT="${1#-n}"
+        LOG_LIMIT_SET=true
+        shift
+        ;;
+      --limit=*)
+        LOG_LIMIT="${1#*=}"
+        LOG_LIMIT_SET=true
+        shift
+        ;;
+      -[!-]?*)
+        local flags="${1#-}"
+        local -a split=()
+        shift
+        while [[ -n "$flags" ]]; do
+          split[${#split[@]}]="-${flags:0:1}"
+          flags="${flags:1}"
+        done
+        set -- "${split[@]}" "$@"
+        ;;
+      -*)
+        die "unknown option: $1"
+        ;;
+      *)
+        if [[ "$mode" != "branch" ]]; then
+          die "g log takes no arguments; 'g branch-log $1' is the comparison"
+        fi
+        if [[ -n "$base_arg" ]]; then
+          die "usage: ${usage_line}"
+        fi
+        base_arg="$1"
+        shift
+        ;;
+    esac
+  done
+
+  case "$LOG_LIMIT" in
+    ''|*[!0-9]*) die "not a number of commits: ${LOG_LIMIT}" ;;
+  esac
+
+  require_repo
+
+  local current base mb range fork='' whole=false
+  if ! current=$(git rev-parse --abbrev-ref HEAD 2>/dev/null); then
+    die 'no commits yet — there is nothing to log'
+  fi
+
+  if [[ "$mode" == "branch" ]]; then
+    if [[ -n "$base_arg" ]]; then
+      base="$base_arg"
+      if ! git rev-parse --verify --quiet "$base" >/dev/null; then
+        die "no such branch: ${base}"
+      fi
+    else
+      base=$(_log_detect_base)
+      # Standing on the base itself, the interesting question is what has not
+      # been pushed yet — and with no origin there is nothing to compare with.
+      if [[ -n "$base" && "$base" == "$current" ]]; then
+        if git rev-parse --verify --quiet "origin/${current}" >/dev/null 2>&1; then
+          base="origin/${current}"
+        else
+          base=''
+        fi
+      fi
+      if [[ -z "$base" ]]; then
+        die 'no base branch to compare with; g log shows the whole history'
+      fi
+    fi
+
+    mb=$(git merge-base "$base" HEAD 2>/dev/null) ||
+      die "'${base}' and HEAD have no common ancestor"
+    range="${mb}..HEAD"
+    fork=$(git rev-parse --short "$mb" 2>/dev/null) || fork=''
+    # Only worth naming the fork point when the base has moved past it.
+    if [[ "$(git rev-parse "$base" 2>/dev/null)" == "$mb" ]]; then
+      fork=''
+    fi
+  else
+    whole=true
+    range='HEAD'
+  fi
+
+  local total shown limit
+  total=$(git rev-list --count "$range" 2>/dev/null) || total=0
+
+  limit=$LOG_LIMIT
+  if (( limit == 0 )) && [[ "$whole" == "true" && "$LOG_LIMIT_SET" == "false" ]]; then
+    limit=20
+  fi
+  shown=$total
+  if (( limit > 0 && limit < total )); then
+    shown=$limit
+  fi
+
+  section 'Commits'
+
+  if [[ "$current" == 'HEAD' ]]; then
+    kv 'Branch' '(detached HEAD)'
+  else
+    kv 'Branch' "$(paint "$C_BOLD" "$current")"
+  fi
+
+  if [[ "$whole" == "false" ]]; then
+    kv 'Base' "${base}${fork:+ (forked at ${fork})}"
+  fi
+
+  if (( total == 0 )); then
+    printf '\n'
+    if [[ "$whole" == "true" ]]; then
+      muted 'No commits yet.'
+    elif [[ "$current" == "$base" ]]; then
+      muted "No commits: you are on ${base}."
+    else
+      muted "No commits: ${current} is level with ${base}."
+    fi
+    printf '\n'
+    return 0
+  fi
+
+  local when count_text
+  when=$(git log -1 --format='%ar' "$range" 2>/dev/null) || when=''
+  count_text="$shown"
+  if (( shown < total )); then
+    count_text="${shown} of ${total}"
+  fi
+  if [[ -n "$when" ]]; then
+    count_text="${count_text} (last ${when})"
+  fi
+  kv 'Commits' "$count_text"
+
+  local -a authors=()
+  local a joined=''
+  # Always name a limit: bash 3.2 under `set -u` treats "${arr[@]}" on an
+  # empty array as unbound, and -n "$total" is a no-op anyway.
+  local -a author_args=()
+  author_args=(-n "$shown")
+  while IFS= read -r a; do
+    if [[ -n "$a" ]]; then
+      authors[${#authors[@]}]="$a"
+    fi
+  done < <(git log "${author_args[@]}" --format='%aN' "$range" 2>/dev/null | sort -u)
+
+  if (( ${#authors[@]} == 1 )); then
+    kv 'Author' "${authors[0]}"
+  elif (( ${#authors[@]} > 1 )); then
+    for (( i = 0; i < ${#authors[@]}; i++ )); do
+      joined+="${joined:+, }${authors[$i]}"
+    done
+    kv 'Authors' "$joined"
+  fi
+
+  if [[ "$whole" == "false" ]]; then
+    local stat
+    stat=$(git diff --shortstat "$mb"..HEAD 2>/dev/null) || stat=''
+    if [[ -n "$stat" ]]; then
+      kv 'Diff' "$stat"
+    fi
+  fi
+
+  printf '\n'
+
+  local fmt='%x1e%h%x1f%ad%x1f%ar%x1f%an%x1f%ae%x1f%s%x1f%p'
+  if [[ "$LOG_WANT_BODY" == "true" ]]; then
+    fmt+='%n%b'
+  fi
+
+  local -a log_args=("--format=${fmt}" --date=short -M)
+  if (( shown < total )); then
+    log_args+=(-n "$shown")
+  fi
+  if [[ "$LOG_STAT" == "true" ]]; then
+    log_args+=(--raw --numstat)
+  else
+    log_args+=(--name-status)
+  fi
+
+  local line entry head rest
+  LOG_PRINTED=false
+  _log_reset
+
+  while IFS= read -r line; do
+    case "$line" in
+      $'\x1e'*)
+        _log_emit
+        _log_reset
+        _log_header "${line#$'\x1e'}"
+        ;;
+      :[0-7]*$'\t'*)
+        head="${line%%$'\t'*}"
+        _log_file "${head##* }" "${line#*$'\t'}"
+        ;;
+      [0-9-]*$'\t'[0-9-]*$'\t'*)
+        rest="${line#*$'\t'}"
+        entry="${line%%$'\t'*}"$'\x1f'"${rest%%$'\t'*}"
+        LOG_NUM[${#LOG_NUM[@]}]="$entry"
+        ;;
+      [A-Z]*$'\t'*)
+        _log_file "${line%%$'\t'*}" "${line#*$'\t'}"
+        ;;
+      *)
+        LOG_TEXT[${#LOG_TEXT[@]}]="$line"
+        ;;
+    esac
+  done < <(git log "${log_args[@]}" "$range" 2>/dev/null || true)
+
+  _log_emit
+
+  if (( shown < total )); then
+    printf '\n'
+    muted "$(( total - shown )) more $(_plural "$(( total - shown ))" commit commits), not shown — raise -n to see them."
+  fi
+
+  printf '\n'
+}
+
 # ── g grep ──────────────────────────────────────────────────────────────────
 # Ported from ~/bitbucket/pftylr/utils/git/git-grep-all, reshaped around the
 # two ways it gets used: inside a repository it is plain `git grep`; outside it
@@ -2864,7 +3357,9 @@ Commands:
   version             Show the version
   branches            List local branches with their state
   branch-summary      Summarise the current branch against its base
+  branch-log          The commits this branch adds, with their changes
   grep                git grep here, or across every indexed repository
+  log                 The whole history, commit by commit
   repos               List the repositories g has been run in
   untracked           List untracked files with size and age
   gc                  Reclaim space in the repository
@@ -2915,6 +3410,12 @@ run_cmd() {
       ;;
     grep)
       cmd_grep "$@"
+      ;;
+    log)
+      cmd_log "$@"
+      ;;
+    branch-log)
+      cmd_branch_log "$@"
       ;;
     repos)
       cmd_repos "$@"

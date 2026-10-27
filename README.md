@@ -32,6 +32,8 @@ g version
 | `g branches` | List local branches with their state |
 | `g branch-summary` | Summarise the current branch against its base |
 | `g grep` | `git grep` here, or across every indexed repository |
+| `g log` | The whole history, commit by commit |
+| `g branch-log` | The commits this branch adds, with their changes |
 | `g repos` | List the repositories g has been run in |
 | `g untracked` | List untracked files with size and age |
 | `g gc` | Reclaim space in the repository |
@@ -39,6 +41,93 @@ g version
 
 Utilities from `~/bitbucket/pftylr/utils/git` are ported one at a time; each
 one appears in `g help` and in the table above as it lands.
+
+## `g log`
+
+The whole history, in the blocks `g branch-log` prints — hash, subject, author,
+age, message and the files each commit changed. Nothing stops the walk at a
+base, so it runs back through the entire history.
+
+```bash
+g log            # the last 20 commits
+g log -n 0       # all of them
+g log -n 5 -s    # five commits, with per-file line counts
+```
+
+```
+Commits
+────────
+Branch           feature/x
+Commits          3 (last 2 minutes ago)
+Author           Paul Taylor
+
+  77e0b52  Add a file
+           2026-10-27  Paul Taylor <pt@example.com>, 2 minutes ago
+
+           A  added.txt
+```
+
+There is no `Base` or `Diff` row, because there is nothing to measure against.
+Everything else — the options, the colours, the merge annotation, `--no-body` —
+is shared with `g branch-log`, which is the same code behind a range that stops.
+
+## `g branch-log`
+
+What your branch adds, commit by commit — ported from `git-log` in
+`~/bitbucket/pftylr/utils/git`. The original printed
+`git log MERGE_BASE..HEAD --name-status` against a hardcoded `origin/main`;
+this finds the base the way the other commands do and gives every commit a
+block of its own.
+
+```bash
+g branch-log                 # everything on this branch that the base lacks
+g branch-log -s              # ...with added and removed line counts per file
+g branch-log -n 5            # the last five only
+g branch-log develop         # ...against something else
+g branch-log --no-body       # subjects and files, without message bodies
+```
+
+```
+Commits
+────────
+Branch           feature/nicer-log
+Base             main (forked at 7a9fd48)
+Commits          3 (last 12 minutes ago)
+Author           Paul Taylor
+Diff             4 files changed, 3 insertions(+)
+
+  5e3eb93  Add a new file, a soon-deleted file and a binary
+           2026-10-27  Paul Taylor <pt@example.com>, 12 minutes ago
+
+           This body is indented under the commit, and blank lines between
+           paragraphs are kept.
+
+           A  added.txt
+           A  willgo.txt
+
+  8b8c4fa  Rename keep.txt, drop willgo.txt, extend base again
+           2026-10-27  Paul Taylor <pt@example.com>, 12 minutes ago
+
+           M  base.txt
+           R  keep.txt → renamed.txt
+           D  willgo.txt
+```
+
+A is green, M yellow, D red and R cyan, and a rename shows both paths with an
+arrow between them. With `-s` each file is followed by its line counts, `-`
+standing in for a binary. A merge commit has no file list — git does not
+diff one — so the block says `merge of 2 parents` instead of looking empty.
+
+**The base** is `main`, `master` or `develop` when the current branch already
+contains one of them, local before origin; failing that, the nearest ancestor
+branch. This is deliberately not `g branch-summary`'s rule, which always takes
+the nearest ancestor: a sibling branch merged back in is nearer by commit
+count but makes a useless range. Name a `BASE` to overrule it. Standing on the
+base itself, the range becomes the commits you have not pushed yet, and a
+repository with no base at all says so and points at `g log`.
+
+`g log` is the same report without the stopping point, and `g branch-summary`
+is the aggregated view of the same range.
 
 ## `g grep`
 
