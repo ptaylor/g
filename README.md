@@ -361,12 +361,14 @@ do, the question says what that is rather than asking about the set.
 **The sync** commits only what git already tracks: modifications and deletions
 are staged with `git add -u`, anything you had already staged is committed, and
 untracked files are listed and left where they are — the original swept all of
-them in with `git add .`. It commits with `-m` or a timestamp, rebases onto the
-upstream rather than merging so history stays linear, and pushes only what is
-still ahead. A branch with no upstream is published with `--set-upstream` even
-when its commits are already on the remote under another name. With more than
-one repository, each block of steps is headed by its path and prefixed with its
-name.
+them in with `git add .`. The default message says where the commit came from,
+`Assisted sync with g at 19:04:46 on 27/10/2026`, and `-m` replaces it.
+
+It then rebases onto the upstream rather than merging, so history stays linear,
+and pushes only what is still ahead. A branch with no upstream is published with
+`--set-upstream` even when its commits are already on the remote under another
+name. With more than one repository, each block of steps is headed by its path
+and prefixed with its name.
 
 `-n` stops after the report; `-y` skips the question. Without a terminal to ask
 on it refuses rather than assuming yes.

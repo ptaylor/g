@@ -3565,7 +3565,7 @@ _sync_act() {
   fi
 
   if [[ -z "$msg" ]]; then
-    msg="Update at $(date '+%H:%M:%S on %d/%m/%Y')"
+    msg="Assisted sync with g at $(date '+%H:%M:%S on %d/%m/%Y')"
   fi
 
   if (( n > 0 )); then
@@ -3654,8 +3654,10 @@ Options:
 
 Only tracked files are committed: modifications and deletions are staged with
 `git add -u`, and untracked files are listed but left where they are. (The
-original swept everything in with `git add .`.) Updates are rebased onto the
-upstream rather than merged, so the history stays linear.
+original swept everything in with `git add .`.) The default message names the
+tool and the time — "Assisted sync with g at 19:04:46 on 27/10/2026" — and `-m`
+replaces it. Updates are rebased onto the upstream rather than merged, so the
+history stays linear.
 EOF
 
   printf '\n'
