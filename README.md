@@ -118,6 +118,10 @@ There is no `Base` or `Diff` row, because there is nothing to measure against.
 Everything else — the options, the colours, the merge annotation, `--no-body` —
 is shared with `g branch-log`, which is the same code behind a range that stops.
 
+Going to a terminal, the report is paged through `$G_PAGER`, `$PAGER` or `less`,
+with git's own `LESS=FRX` default so colour survives and the last screen stays
+put. Piped, or with `--no-pager`, it is written straight out.
+
 ## `g branch-log`
 
 What your branch adds, commit by commit — ported from `git-log` in

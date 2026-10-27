@@ -2116,7 +2116,10 @@ Options:
   -n, --limit N   Show at most N commits (0 for all of them; default 20)
   -s, --stat      Add per-file added and removed line counts
       --no-body   Leave out commit message bodies
+      --no-pager  Don't page the output
   -h, --help      Show this help
+
+Long output is paged when it goes to a terminal, through G_PAGER, PAGER or less.
 
 For just the commits this branch adds, use g branch-log.
 EOF
@@ -2138,7 +2141,10 @@ Options:
   -n, --limit N   Show at most N commits (default: all of them)
   -s, --stat      Add per-file added and removed line counts
       --no-body   Leave out commit message bodies
+      --no-pager  Don't page the output
   -h, --help      Show this help
+
+Long output is paged when it goes to a terminal, through G_PAGER, PAGER or less.
 
 BASE defaults to main, master or develop when HEAD already contains one of
 them, local before origin, and otherwise to the nearest ancestor branch. On a
@@ -2153,11 +2159,53 @@ EOF
 }
 
 cmd_log() {
-  _log_main history "$@"
+  _log_page history "$@"
 }
 
 cmd_branch_log() {
-  _log_main branch "$@"
+  _log_page branch "$@"
+}
+
+# _log_pager — the pager to use, or nothing when there is none to use.
+_log_pager() {
+  local pager="${G_PAGER:-${PAGER:-less}}" prog
+
+  if [[ -z "$pager" ]]; then
+    return 0
+  fi
+  prog="${pager%% *}"
+  if ! command -v "$prog" >/dev/null 2>&1; then
+    return 0
+  fi
+  printf '%s\n' "$pager"
+}
+
+# _log_page MODE [args] — run the report through a pager when it is going to a
+# terminal. Colour is decided at startup from that same terminal, so the pager
+# still gets it; LESS follows git's own default so less passes the escapes
+# through and leaves the last screen behind.
+_log_page() {
+  local mode="$1" a no_pager=false pager=''
+  shift
+
+  for a in "$@"; do
+    if [[ "$a" == '--no-pager' ]]; then
+      no_pager=true
+    fi
+  done
+
+  if [[ "$no_pager" != "true" ]] && [[ -t 1 ]]; then
+    pager=$(_log_pager)
+  fi
+
+  if [[ -z "$pager" ]]; then
+    _log_main "$mode" "$@"
+    return 0
+  fi
+
+  # Through sh, as git does it, so a pager given with arguments or a pipe in it
+  # behaves the way it was written.
+  _log_main "$mode" "$@" | LESS="${LESS:-FRX}" sh -c "$pager"
 }
 
 # _log_main MODE [options] [BASE] — the one implementation behind both commands.
@@ -2194,6 +2242,9 @@ _log_main() {
         ;;
       --no-body)
         LOG_WANT_BODY=false
+        shift
+        ;;
+      --no-pager)
         shift
         ;;
       -n|--limit)
