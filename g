@@ -3029,6 +3029,9 @@ _cache_current_repo() {
   if [[ -z "$top" ]]; then
     return 0
   fi
+  # One repository, one spelling: on macOS /tmp and /private/tmp are the same
+  # directory, and the cache should not hold the same checkout twice.
+  top=$(cd "$top" 2>/dev/null && pwd -P) || return 0
 
   cache=$(_repos_cache_file)
   if [[ -f "$cache" ]] && grep -qxF -e "$top" "$cache" 2>/dev/null; then
@@ -3224,6 +3227,592 @@ cmd_repos() {
     kv 'Missing' "$missing"
   fi
   printf '\n'
+}
+
+# ── g sync ──────────────────────────────────────────────────────────────────
+# Ported from ~/bitbucket/pftylr/utils/git/git-push-changes, which committed a
+# whole directory under a timestamp, pulled origin/main and pushed, without
+# looking at the repository first and without checking that any step worked.
+# Here the repositories are named from the cache g repos keeps — every one that
+# answers to the name, since the same project is often checked out twice — and
+# each is reported on and confirmed before anything is touched. Unlike the
+# original, only tracked files are committed: untracked ones are reported and
+# left where they are.
+
+SYNC_YES=false
+SYNC_DRY_RUN=false
+SYNC_MESSAGE=''
+
+SYNC_PATH='' SYNC_NAME='' SYNC_BRANCH='' SYNC_UPSTREAM='' SYNC_REMOTE=''
+SYNC_STATE='' SYNC_WHY='' SYNC_PLAN='' SYNC_DETAIL=''
+SYNC_BEHIND=0 SYNC_AHEAD=0 SYNC_CHANGED=0 SYNC_UNTRACKED=0
+SYNC_CHANGES=()
+
+# _sync_targets WANT — every cached repository answering to that name, one path
+# per line. A path suffix is accepted when a bare name will not do.
+_sync_targets() {
+  local want="$1" cache path name
+  local -a by_name=()
+  local -a by_path=()
+  local -a found=()
+
+  cache=$(_repos_cache_file)
+  if [[ ! -f "$cache" ]]; then
+    die 'no repositories cached yet — run a g command inside one first'
+  fi
+
+  while IFS= read -r path; do
+    if [[ -z "$path" ]]; then
+      continue
+    fi
+    name="${path##*/}"
+    if [[ "$name" == "$want" ]]; then
+      by_name[${#by_name[@]}]="$path"
+    fi
+    if [[ "$path" == */"$want" ]]; then
+      by_path[${#by_path[@]}]="$path"
+    fi
+  done <"$cache"
+
+  if (( ${#by_name[@]} > 0 )); then
+    found=("${by_name[@]}")
+  elif (( ${#by_path[@]} > 0 )); then
+    found=("${by_path[@]}")
+  fi
+
+  if (( ${#found[@]} == 0 )); then
+    die "no cached repository named '${want}'; 'g repos ${want}' lists what is close"
+  fi
+
+  printf '%s\n' "${found[@]}" | sort -u
+}
+
+# _sync_operation GITDIR — the git operation in progress, if any.
+_sync_operation() {
+  local gitdir="$1"
+
+  if [[ -z "$gitdir" ]]; then
+    return 0
+  fi
+  if [[ -f "$gitdir/MERGE_HEAD" ]]; then
+    printf 'merge in progress'
+  elif [[ -d "$gitdir/rebase-merge" || -d "$gitdir/rebase-apply" ]]; then
+    printf 'rebase in progress'
+  elif [[ -f "$gitdir/CHERRY_PICK_HEAD" ]]; then
+    printf 'cherry-pick in progress'
+  elif [[ -f "$gitdir/REVERT_HEAD" ]]; then
+    printf 'revert in progress'
+  elif [[ -f "$gitdir/BISECT_LOG" ]]; then
+    printf 'bisect in progress'
+  fi
+}
+
+# _sync_probe DIR — read one repository into the SYNC_* globals, leaving SYNC_WHY
+# set when it cannot be synced. Changes directory into it, which the act step
+# then relies on.
+_sync_probe() {
+  local dir="$1" counts out gitdir
+
+  SYNC_PATH="$dir"
+  SYNC_NAME="${dir##*/}"
+  SYNC_BRANCH='' SYNC_UPSTREAM='' SYNC_REMOTE='' SYNC_STATE=''
+  SYNC_WHY='' SYNC_PLAN='' SYNC_DETAIL=''
+  SYNC_BEHIND=0 SYNC_AHEAD=0 SYNC_CHANGED=0 SYNC_UNTRACKED=0
+  SYNC_CHANGES=()
+
+  if [[ ! -d "$dir" ]]; then
+    SYNC_WHY="it has gone from the disk"
+    return 1
+  fi
+  if ! cd "$dir" 2>/dev/null; then
+    SYNC_WHY="cannot enter it"
+    return 1
+  fi
+  if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    SYNC_WHY="it is no longer a git repository"
+    return 1
+  fi
+
+  SYNC_BRANCH=$(git symbolic-ref --quiet --short HEAD 2>/dev/null) ||
+    SYNC_BRANCH=''
+  if [[ -z "$SYNC_BRANCH" ]]; then
+    SYNC_WHY="HEAD is detached; check out a branch first"
+    return 1
+  fi
+
+  SYNC_UPSTREAM=$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null) ||
+    SYNC_UPSTREAM=''
+  if [[ -n "$SYNC_UPSTREAM" ]]; then
+    SYNC_REMOTE="${SYNC_UPSTREAM%%/*}"
+  elif git remote 2>/dev/null | grep -qx origin; then
+    SYNC_REMOTE='origin'
+  else
+    SYNC_REMOTE=$(git remote 2>/dev/null | head -1) || SYNC_REMOTE=''
+  fi
+  if [[ -z "$SYNC_REMOTE" ]]; then
+    SYNC_WHY="it has no remote to sync with"
+    return 1
+  fi
+
+  gitdir=$(git rev-parse --absolute-git-dir 2>/dev/null) || gitdir=''
+  SYNC_STATE=$(_sync_operation "$gitdir")
+
+  # The remote refs on disk are as old as the last fetch, so distance measured
+  # without one is a lie. Fetching is read-only, so it can happen before the
+  # question.
+  if ! out=$(git fetch --quiet "$SYNC_REMOTE" 2>&1); then
+    SYNC_DETAIL="$out"
+    SYNC_WHY="cannot reach ${SYNC_REMOTE}"
+    return 1
+  fi
+
+  if [[ -n "$SYNC_UPSTREAM" ]]; then
+    counts=$(git rev-list --left-right --count "${SYNC_UPSTREAM}...HEAD" 2>/dev/null) ||
+      counts=''
+    if [[ -n "$counts" ]]; then
+      SYNC_BEHIND="${counts%%[[:space:]]*}"
+      SYNC_AHEAD="${counts##*[[:space:]]}"
+    fi
+  else
+    SYNC_AHEAD=$(git rev-list --count HEAD --not --remotes 2>/dev/null) || SYNC_AHEAD=0
+  fi
+
+  local line
+  while IFS= read -r line; do
+    if [[ -z "$line" ]]; then
+      continue
+    fi
+    case "${line:0:2}" in
+      '??') SYNC_UNTRACKED=$(( SYNC_UNTRACKED + 1 )) ;;
+      *)    SYNC_CHANGED=$(( SYNC_CHANGED + 1 )) ;;
+    esac
+    SYNC_CHANGES[${#SYNC_CHANGES[@]}]="${line:0:2}"$'\x1f'"${line:3}"
+  done < <(git status --porcelain 2>/dev/null || true)
+
+  if [[ -n "$SYNC_STATE" ]]; then
+    SYNC_WHY="a ${SYNC_STATE} — finish or abort it before syncing"
+    return 1
+  fi
+
+  return 0
+}
+
+# _sync_plan — what a sync of the probed repository would do, in words.
+_sync_plan() {
+  local where="${SYNC_REMOTE}/${SYNC_BRANCH}" total i p
+  local -a parts=()
+
+  SYNC_PLAN=''
+  total=$SYNC_CHANGED
+
+  if (( total > 0 )); then
+    parts[${#parts[@]}]="commit ${total} $(_plural "$total" file files)"
+  fi
+  if (( SYNC_BEHIND > 0 )); then
+    parts[${#parts[@]}]="update from ${SYNC_UPSTREAM}"
+  fi
+  # Committing anything means there will be something to push, even though the
+  # distance measured a moment ago said otherwise.
+  if (( SYNC_AHEAD > 0 )) || (( total > 0 )) || [[ -z "$SYNC_UPSTREAM" ]]; then
+    parts[${#parts[@]}]="push to ${where}"
+  fi
+
+  if (( ${#parts[@]} == 0 )); then
+    return 0
+  fi
+
+  for (( i = 0; i < ${#parts[@]}; i++ )); do
+    p="${parts[$i]}"
+    if (( i == 0 )); then
+      SYNC_PLAN="$p"
+    elif (( i == ${#parts[@]} - 1 )); then
+      SYNC_PLAN+=" and ${p}"
+    else
+      SYNC_PLAN+=", ${p}"
+    fi
+  done
+}
+
+# _sync_item ENTRY — print one porcelain entry as a coloured item.
+_sync_item() {
+  local entry="$1" code file colour marker
+
+  code="${entry%%$'\x1f'*}"
+  file="${entry#*$'\x1f'}"
+
+  colour="$C_YELLOW"
+  marker='M'
+  case "$code" in
+    '??') marker='?'; colour="$C_CYAN" ;;
+    *A*)  marker='A'; colour="$C_GREEN" ;;
+    *D*)  marker='D'; colour="$C_RED" ;;
+    *R*)  marker='R'; colour="$C_CYAN" ;;
+  esac
+
+  item "$colour" "$marker" "$file"
+}
+
+# _sync_report — print the probed repository as a block.
+_sync_report() {
+  section "Sync ${SYNC_NAME}"
+
+  kv 'Path' "$SYNC_PATH"
+  if [[ -n "$SYNC_BRANCH" ]]; then
+    kv 'Branch' "$SYNC_BRANCH"
+  fi
+  if [[ -n "$SYNC_REMOTE" ]]; then
+    if [[ -n "$SYNC_WHY" && "$SYNC_WHY" == "cannot reach "* ]]; then
+      kv 'Remote' "$(paint "$C_RED" "${SYNC_REMOTE} (unreachable)")"
+    else
+      kv 'Remote' "$SYNC_REMOTE"
+    fi
+  fi
+
+  if [[ -n "$SYNC_UPSTREAM" ]]; then
+    local distance='in sync'
+    if (( SYNC_BEHIND > 0 && SYNC_AHEAD > 0 )); then
+      distance="${SYNC_BEHIND} behind, ${SYNC_AHEAD} ahead"
+    elif (( SYNC_BEHIND > 0 )); then
+      distance="${SYNC_BEHIND} behind"
+    elif (( SYNC_AHEAD > 0 )); then
+      distance="${SYNC_AHEAD} ahead"
+    fi
+    kv 'Upstream' "${SYNC_UPSTREAM} (${distance})"
+  elif [[ -n "$SYNC_BRANCH" && -n "$SYNC_REMOTE" ]]; then
+    kv 'Upstream' "none — will push to ${SYNC_REMOTE}/${SYNC_BRANCH} and set it"
+  fi
+
+  if [[ -n "$SYNC_BRANCH" ]]; then
+    local tree='clean'
+    if (( SYNC_CHANGED + SYNC_UNTRACKED > 0 )); then
+      tree=''
+      if (( SYNC_CHANGED > 0 )); then
+        tree="${SYNC_CHANGED} changed"
+      fi
+      if (( SYNC_UNTRACKED > 0 )); then
+        tree="${tree:+${tree}, }${SYNC_UNTRACKED} untracked"
+      fi
+    fi
+    kv 'Working tree' "$tree"
+    kv 'State' "${SYNC_STATE:-clean}"
+  fi
+
+  if [[ -n "$SYNC_PLAN" ]]; then
+    kv 'Plan' "$SYNC_PLAN"
+  fi
+
+  local i entry shown=0 limit=15
+
+  if (( SYNC_CHANGED > 0 )); then
+    printf '\n'
+    muted 'Uncommitted'
+    for (( i = 0; i < ${#SYNC_CHANGES[@]}; i++ )); do
+      entry="${SYNC_CHANGES[$i]}"
+      if [[ "${entry%%$'\x1f'*}" == '??' ]]; then
+        continue
+      fi
+      if (( shown >= limit )); then
+        break
+      fi
+      _sync_item "$entry"
+      shown=$(( shown + 1 ))
+    done
+    if (( SYNC_CHANGED > limit )); then
+      muted "  … $(( SYNC_CHANGED - limit )) more"
+    fi
+  fi
+
+  if (( SYNC_UNTRACKED > 0 )); then
+    printf '\n'
+    muted 'Untracked (left alone)'
+    shown=0
+    for (( i = 0; i < ${#SYNC_CHANGES[@]}; i++ )); do
+      entry="${SYNC_CHANGES[$i]}"
+      if [[ "${entry%%$'\x1f'*}" != '??' ]]; then
+        continue
+      fi
+      if (( shown >= limit )); then
+        break
+      fi
+      _sync_item "$entry"
+      shown=$(( shown + 1 ))
+    done
+    if (( SYNC_UNTRACKED > limit )); then
+      muted "  … $(( SYNC_UNTRACKED - limit )) more"
+    fi
+  fi
+
+  if [[ -n "$SYNC_WHY" ]]; then
+    printf '\n'
+    warn "${SYNC_WHY}"
+    if [[ -n "$SYNC_DETAIL" ]]; then
+      printf '%s\n' "$SYNC_DETAIL" | relay
+    fi
+  fi
+}
+
+# _sync_act LABEL — commit, update and push the probed repository. The caller has
+# already confirmed; a failure here stops this repository, not the run.
+_sync_act() {
+  local label="$1" msg="$SYNC_MESSAGE" out='' to_push=0 publish=false failed=false
+  local n=$SYNC_CHANGED
+  local where="${SYNC_REMOTE}/${SYNC_BRANCH}"
+
+  # Never commit into the middle of something, whatever the caller believed.
+  if [[ -n "$SYNC_STATE" ]]; then
+    err "${label}a ${SYNC_STATE}"
+    return 1
+  fi
+
+  if [[ -z "$msg" ]]; then
+    msg="Update at $(date '+%H:%M:%S on %d/%m/%Y')"
+  fi
+
+  if (( n > 0 )); then
+    # -u, not -A: untracked files are the caller's to name, not ours to sweep up.
+    if ! out=$(git add -u 2>&1); then
+      err "${label}could not stage the changes"
+      [[ -n "$out" ]] && printf '%s\n' "$out" | relay
+      return 1
+    fi
+    if ! out=$(git commit -q -m "$msg" 2>&1); then
+      err "${label}could not commit the changes"
+      [[ -n "$out" ]] && printf '%s\n' "$out" | relay
+      return 1
+    fi
+    step "${label}committed ${n} $(_plural "$n" file files)"
+  fi
+
+  if [[ -n "$SYNC_UPSTREAM" ]]; then
+    if ! out=$(git pull --rebase --quiet 2>&1); then
+      err "${label}could not update from ${SYNC_UPSTREAM}"
+      [[ -n "$out" ]] && printf '%s\n' "$out" | relay
+      return 1
+    fi
+    if (( SYNC_BEHIND > 0 )); then
+      step "${label}updated from ${SYNC_UPSTREAM} (${SYNC_BEHIND} $(_plural "$SYNC_BEHIND" commit commits))"
+    fi
+  fi
+
+  if [[ -n "$SYNC_UPSTREAM" ]]; then
+    to_push=$(git rev-list --count "${SYNC_UPSTREAM}..HEAD" 2>/dev/null) || to_push=0
+  else
+    to_push=$(git rev-list --count HEAD --not --remotes 2>/dev/null) || to_push=0
+    # A branch with no upstream gets published even when its commits are
+    # already on the remote under another name — that is the point of naming it.
+    publish=true
+  fi
+
+  if (( to_push > 0 )) || [[ "$publish" == "true" ]]; then
+    if [[ -n "$SYNC_UPSTREAM" ]]; then
+      if ! out=$(git push --quiet 2>&1); then
+        failed=true
+      fi
+    else
+      if ! out=$(git push --quiet --set-upstream "$SYNC_REMOTE" "$SYNC_BRANCH" 2>&1); then
+        failed=true
+      fi
+    fi
+    if [[ "$failed" == "true" ]]; then
+      err "${label}could not push to ${where}"
+      [[ -n "$out" ]] && printf '%s\n' "$out" | relay
+      return 1
+    fi
+    if (( to_push > 0 )); then
+      step "${label}pushed ${to_push} $(_plural "$to_push" commit commits) to ${where}"
+    else
+      step "${label}published ${SYNC_BRANCH} as ${where}"
+    fi
+  fi
+
+  return 0
+}
+
+sync_usage() {
+  section "g sync — commit, update and push cached repositories"
+
+  cat <<'EOF'
+Usage:
+  g sync [options] NAME
+
+Brings repositories into line: commits whatever is uncommitted, updates from the
+upstream, and pushes. It works in them, not in yours.
+
+NAME is a repository name exactly as g repos lists it, and every cached
+repository answering to it is synced — the same project is often checked out
+twice. A path suffix narrows it when the bare name is not enough (pftylr/g).
+
+Before touching anything each repository is reported on: branch, distance from
+its upstream, anything uncommitted, and any merge, rebase, cherry-pick, revert
+or bisect in progress. Those are refused individually, and the rest carry on.
+
+Options:
+  -y, --yes          Don't ask before syncing
+  -n, --dry-run      Report and stop
+  -m, --message MSG  Commit message for what it commits
+  -h, --help         Show this help
+
+Only tracked files are committed: modifications and deletions are staged with
+`git add -u`, and untracked files are listed but left where they are. (The
+original swept everything in with `git add .`.) Updates are rebased onto the
+upstream rather than merged, so the history stays linear.
+EOF
+
+  printf '\n'
+}
+
+cmd_sync() {
+  SYNC_YES=false
+  SYNC_DRY_RUN=false
+  SYNC_MESSAGE=''
+  local target=''
+
+  while (( $# )); do
+    case "$1" in
+      -h|--help)
+        sync_usage
+        return 0
+        ;;
+      -y|--yes)
+        SYNC_YES=true
+        shift
+        ;;
+      -n|--dry-run)
+        SYNC_DRY_RUN=true
+        shift
+        ;;
+      -m|--message)
+        if (( $# < 2 )); then
+          die 'usage: g sync [-y] [-n] [-m MSG] NAME'
+        fi
+        SYNC_MESSAGE="$2"
+        shift 2
+        ;;
+      --message=*)
+        SYNC_MESSAGE="${1#*=}"
+        shift
+        ;;
+      -[!-]?*)
+        local flags="${1#-}"
+        local -a split=()
+        shift
+        while [[ -n "$flags" ]]; do
+          split[${#split[@]}]="-${flags:0:1}"
+          flags="${flags:1}"
+        done
+        set -- "${split[@]}" "$@"
+        ;;
+      -*)
+        die "unknown option: $1"
+        ;;
+      *)
+        if [[ -n "$target" ]]; then
+          die 'usage: g sync [-y] [-n] [-m MSG] NAME'
+        fi
+        target="$1"
+        shift
+        ;;
+    esac
+  done
+
+  if [[ -z "$target" ]]; then
+    die 'usage: g sync [-y] [-n] [-m MSG] NAME'
+  fi
+
+  local list
+  list=$(_sync_targets "$target")
+
+  local -a paths=()
+  local p
+  while IFS= read -r p; do
+    if [[ -n "$p" ]]; then
+      paths[${#paths[@]}]="$p"
+    fi
+  done <<<"$list"
+
+  local -a todo_path=()
+  local -a todo_name=()
+  local -a todo_plan=()
+  local i skipped=0
+
+  for (( i = 0; i < ${#paths[@]}; i++ )); do
+    if _sync_probe "${paths[$i]}"; then
+      _sync_plan
+      if [[ -n "$SYNC_PLAN" ]]; then
+        todo_path[${#todo_path[@]}]="$SYNC_PATH"
+        todo_name[${#todo_name[@]}]="$SYNC_NAME"
+        todo_plan[${#todo_plan[@]}]="$SYNC_PLAN"
+      fi
+    else
+      skipped=$(( skipped + 1 ))
+    fi
+    _sync_report
+  done
+
+  printf '\n'
+
+  if [[ "$SYNC_DRY_RUN" == "true" ]]; then
+    muted 'Dry run: nothing was changed.'
+    printf '\n'
+    return 0
+  fi
+
+  if (( ${#todo_path[@]} == 0 )); then
+    muted 'Nothing to do.'
+    printf '\n'
+    if (( skipped > 0 )); then
+      return 1
+    fi
+    return 0
+  fi
+
+  if [[ "$SYNC_YES" != "true" ]]; then
+    local question=''
+    if (( ${#todo_path[@]} == 1 )); then
+      question="Sync ${todo_name[0]}: ${todo_plan[0]}?"
+    elif (( ${#todo_path[@]} == 2 )); then
+      question='Sync both repositories?'
+    else
+      question="Sync all ${#todo_path[@]} repositories?"
+    fi
+
+    if ! have_tty; then
+      die 'no terminal is available to confirm; pass -y to proceed'
+    fi
+    if ! ask_yes_no "$question"; then
+      printf '\n' >&2
+      die 'aborted'
+    fi
+    printf '\n'
+  fi
+
+  local failed=0 label=''
+  for (( i = 0; i < ${#todo_path[@]}; i++ )); do
+    # Label the steps whenever more than one repository was named, even if only
+    # one of them turned out to have anything to do.
+    if (( ${#paths[@]} > 1 )); then
+      printf '\n'
+      muted "${todo_path[$i]}"
+      label="${todo_name[$i]}: "
+    fi
+    if ! _sync_probe "${todo_path[$i]}"; then
+      err "${label}${SYNC_WHY}"
+      failed=$(( failed + 1 ))
+      continue
+    fi
+    if ! _sync_act "$label"; then
+      failed=$(( failed + 1 ))
+    fi
+  done
+
+  printf '\n'
+
+  if (( skipped > 0 || failed > 0 )); then
+    local missed=$(( skipped + failed ))
+    err "${missed} of ${#paths[@]} $(_plural "${#paths[@]}" repository repositories) $(_plural "$missed" was were) not synced"
+    printf '\n' >&2
+    return 1
+  fi
 }
 
 # ── Commands ────────────────────────────────────────────────────────────────
@@ -3590,6 +4179,7 @@ Commands:
   grep                git grep here, or across every indexed repository
   log                 The whole history, commit by commit
   repos               List the repositories g has been run in
+  sync                Commit, update and push one cached repository
   untracked           List untracked files with size and age
   gc                  Reclaim space in the repository
   worktree, wt        List worktrees and open or create one for a branch
@@ -3654,6 +4244,9 @@ run_cmd() {
       ;;
     untracked)
       cmd_untracked "$@"
+      ;;
+    sync)
+      cmd_sync "$@"
       ;;
     -*)
       err "unknown option: ${cmd}"

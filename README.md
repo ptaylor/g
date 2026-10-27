@@ -36,6 +36,7 @@ g version
 | `g branch-log` | The commits this branch adds, with their changes |
 | `g contributors`, `g who` | Who has written this repository, by number of commits |
 | `g repos` | List the repositories g has been run in |
+| `g sync` | Commit, update and push one cached repository |
 | `g untracked` | List untracked files with size and age |
 | `g gc` | Reclaim space in the repository |
 | `g worktree`, `g wt` | List worktrees and open or create one for a branch |
@@ -291,6 +292,84 @@ again the next time you run something.
 
 Entries whose directory has gone are shown as `missing` rather than dropped, in
 case the path is on an unmounted volume.
+
+## `g sync`
+
+Brings repositories into line — ported from `git-push-changes` in
+`~/bitbucket/pftylr/utils/git`, which committed an entire directory under a
+timestamp, pulled `origin/main` and pushed, without looking first.
+
+```bash
+g sync d              # every cached repository named d, after one confirmation
+g sync -n d           # the health check only
+g sync -y d           # no questions
+g sync -m "Sync" d    # commit message for what it commits
+```
+
+`NAME` matches repository names exactly as `g repos` lists them, and **every**
+repository answering to it is synced: the same project is often checked out
+twice, once under `~/github` and once under `~/bitbucket`, and both usually want
+the same treatment. When the name is too common, a path suffix narrows the set —
+`g sync bitbucket/pftylr/d`.
+
+```
+Sync d
+──────
+Path             /Users/paul/bitbucket/pftylr/d
+Branch           main
+Remote           origin
+Upstream         origin/main (1 behind)
+Working tree     2 changed
+State            clean
+Plan             commit 2 files, update from origin/main and push to origin/main
+
+Uncommitted
+  M g
+  D old.txt
+
+Untracked (left alone)
+  ? notes.txt
+
+Sync d
+──────
+Path             /Users/paul/github/pftylr/d
+Branch           main
+Remote           origin
+Upstream         origin/main (in sync)
+Working tree     1 changed
+State            clean
+Plan             commit 1 file and push to origin/main
+
+Uncommitted
+  M g
+
+? Sync both repositories? [y/N]
+```
+
+**The health check** fetches first — the remote refs on disk are as old as the
+last fetch, so distance measured without one is a lie — then reports, per
+repository, the branch, the distance from its upstream, anything uncommitted
+(listed, so you can see what is about to go in), and whether a merge,
+rebase, cherry-pick, revert or bisect is in progress.
+
+Each repository is judged on its own. One in the middle of a merge, with a
+detached HEAD, with no remote, or with an unreachable remote is reported and
+skipped while the rest carry on; the command exits non-zero if anything was
+skipped or failed, and names the count. When only one repository has anything to
+do, the question says what that is rather than asking about the set.
+
+**The sync** commits only what git already tracks: modifications and deletions
+are staged with `git add -u`, anything you had already staged is committed, and
+untracked files are listed and left where they are — the original swept all of
+them in with `git add .`. It commits with `-m` or a timestamp, rebases onto the
+upstream rather than merging so history stays linear, and pushes only what is
+still ahead. A branch with no upstream is published with `--set-upstream` even
+when its commits are already on the remote under another name. With more than
+one repository, each block of steps is headed by its path and prefixed with its
+name.
+
+`-n` stops after the report; `-y` skips the question. Without a terminal to ask
+on it refuses rather than assuming yes.
 
 ## `g untracked`
 

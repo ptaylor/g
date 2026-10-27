@@ -14,7 +14,7 @@ is pleasant on a terminal and clean in a pipe.
 WIP. The dispatch skeleton, the presentation layer, and the commands ported so
 far are in place: `worktree` (alias `wt`), `gc`, `branches`, `branch-summary`,
 `grep`, `log`, `branch-log`, `contributors` (alias `who`) and `untracked`, plus
-`repos`, which is new rather than a port.
+`repos` and `sync`, which are new rather than ports.
 Further commands are ported one at a time from `~/bitbucket/pftylr/utils/git`
 and must not be assumed to exist until they appear in `g help`.
 
@@ -35,6 +35,7 @@ and must not be assumed to exist until they appear in `g help`.
 ./g branch-log                # the commits this branch adds
 ./g contributors -n 3         # the three busiest authors
 ./g repos                     # repositories g has been run in
+./g sync -n g                 # health check on a cached repository
 ./g untracked                 # untracked files with size and age
 ./g gc -n                     # what a cleanup would do, without doing it
 
