@@ -539,6 +539,14 @@ expires reflog entries, drops unreachable objects older than two weeks and
 prunes worktree registrations missing for three months; `g gc` does not repeat
 any of that, and only the two steps it adds are opt-in.
 
+Unreachable objects younger than that expiry are kept on disk. Without cruft
+packs, repacking writes them back out as loose objects, where they lose the
+delta compression they had inside the pack — which is why a collection can make
+a repository grow instead of shrink. `g gc` therefore runs git with
+`gc.cruftPacks=true` unless you have configured `gc.cruftPacks` yourself, so
+those objects stay in a compact cruft pack until they expire; `g gc -p` is the
+way to drop them immediately.
+
 Unlike the original script, `g gc` never expires the reflog and never repacks
 aggressively unless asked — the first is irreversible, the second rarely pays
 for itself. Destructive cleanup (`git clean -fdx`, `git worktree remove`) and
