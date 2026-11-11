@@ -1636,6 +1636,1036 @@ cmd_untracked() {
   printf '\n'
 }
 
+# ── g status ────────────────────────────────────────────────────────────────
+# New rather than ported: ~/bitbucket/pftylr/utils/git has no status script.
+#
+# One `git status --porcelain=v2 --branch -z` supplies the branch, the distance
+# from the upstream, the stash count and every changed path, so the report
+# costs one walk of the tree however many files have changed. Porcelain output
+# never carries git's "it took N seconds to enumerate untracked files" advice,
+# so the call is timed here instead, and a slow one is explained in terms of
+# the settings that would fix it.
+
+ST_MODE=report
+ST_UNTRACKED=true
+ST_UNTRACKED_WHY=''
+ST_FETCH=false
+ST_PATHS=()
+
+ST_ROOT='' ST_GITDIR='' ST_COMMONDIR='' ST_LINKED=false
+ST_OID='' ST_HEAD='' ST_UPSTREAM='' ST_HAS_AB=false ST_AHEAD=0 ST_BEHIND=0
+ST_STASH=0 ST_SECONDS=0 ST_OP='' ST_OP_STEP='' ST_OP_BRANCH=''
+ST_BASE='' ST_BASE_AHEAD=0 ST_BASE_BEHIND=0
+ST_REMOTE='' ST_REMOTE_HAS_BRANCH=false ST_NO_UPSTREAM=''
+ST_FETCHED=0 ST_NOW=0 ST_STAGED_STAT='' ST_UNSTAGED_STAT=''
+ST_N_CONFLICT=0 ST_N_STAGED=0 ST_N_UNSTAGED=0 ST_N_UNTRACKED=0
+# One entry per porcelain record: its kind (1, 2, u or ?), XY code, submodule
+# field, path, the path it was renamed from, and the file's mtime and size.
+ST_KIND=() ST_XY=() ST_SUB=() ST_PATH=() ST_ORIG=() ST_EPOCH=() ST_BYTES=()
+
+# _st_fail TEXT — die, but with exit status 2 under -q, where 1 means "dirty".
+_st_fail() {
+  err "$@"
+  printf '\n' >&2
+  if [[ "$ST_MODE" == quiet ]]; then
+    exit 2
+  fi
+  exit 1
+}
+
+# _st_ago_into VARIABLE SECONDS — "just now", "5 min ago", "3 days ago".
+_st_ago_into() {
+  local __ag_name="$1" __ag_s="$2" __ag_n __ag_unit
+
+  if (( __ag_s < 60 )); then
+    printf -v "$__ag_name" '%s' 'just now'
+    return 0
+  fi
+  if (( __ag_s < 3600 )); then
+    __ag_n=$(( __ag_s / 60 ))      __ag_unit=min
+  elif (( __ag_s < 86400 )); then
+    __ag_n=$(( __ag_s / 3600 ))    __ag_unit=hour
+  elif (( __ag_s < 1209600 )); then
+    __ag_n=$(( __ag_s / 86400 ))   __ag_unit=day
+  elif (( __ag_s < 5259600 )); then
+    __ag_n=$(( __ag_s / 604800 ))  __ag_unit=week
+  elif (( __ag_s < 31557600 )); then
+    __ag_n=$(( __ag_s / 2629800 )) __ag_unit=month
+  else
+    __ag_n=$(( __ag_s / 31557600 )) __ag_unit=year
+  fi
+  if (( __ag_n != 1 )) && [[ "$__ag_unit" != min ]]; then
+    __ag_unit+=s
+  fi
+  printf -v "$__ag_name" '%d %s ago' "$__ag_n" "$__ag_unit"
+}
+
+# _st_distance_into VARIABLE AHEAD BEHIND SAME — "2 behind, 1 ahead", worded as
+# g sync words it; SAME when both are zero.
+_st_distance_into() {
+  local __di_name="$1" __di_out=''
+  if (( $3 > 0 )); then
+    __di_out="$3 behind"
+  fi
+  if (( $2 > 0 )); then
+    __di_out+="${__di_out:+, }$2 ahead"
+  fi
+  printf -v "$__di_name" '%s' "${__di_out:-$4}"
+}
+
+# _st_pick_remote — origin when it exists, otherwise the first remote, in
+# ST_REMOTE; empty when the repository has none.
+_st_pick_remote() {
+  local r
+  ST_REMOTE=''
+  while IFS= read -r r; do
+    if [[ -z "$r" ]]; then
+      continue
+    fi
+    if [[ -z "$ST_REMOTE" || "$r" == origin ]]; then
+      ST_REMOTE="$r"
+    fi
+  done < <(git remote 2>/dev/null || true)
+}
+
+# _st_locate — the working tree and git directory, with one rev-parse. A linked
+# worktree's git directory names the shared one in its commondir file.
+_st_locate() {
+  local info rel=''
+
+  info=$(git rev-parse --show-toplevel --absolute-git-dir 2>/dev/null) ||
+    _st_fail 'not inside a git working tree'
+  ST_ROOT="${info%%$'\n'*}"
+  ST_GITDIR="${info#*$'\n'}"
+  ST_COMMONDIR="$ST_GITDIR"
+  ST_LINKED=false
+
+  if [[ -f "$ST_GITDIR/commondir" ]]; then
+    IFS= read -r rel <"$ST_GITDIR/commondir" || true
+    case "$rel" in
+      /*) ST_COMMONDIR="$rel" ;;
+      ?*) ST_COMMONDIR="$ST_GITDIR/$rel" ;;
+    esac
+    ST_LINKED=true
+  fi
+}
+
+# _st_fetch — fetch the remote the branch tracks, else origin, else the first.
+# A failure is reported and the report carries on with the refs it has.
+_st_fetch() {
+  local branch remote='' out
+
+  branch=$(git symbolic-ref --quiet --short HEAD 2>/dev/null) || branch=''
+  if [[ -n "$branch" ]]; then
+    remote=$(git config --get "branch.${branch}.remote" 2>/dev/null) || remote=''
+  fi
+  if [[ -z "$remote" || "$remote" == '.' ]]; then
+    _st_pick_remote
+    remote="$ST_REMOTE"
+  fi
+
+  if [[ -z "$remote" ]]; then
+    if [[ "$ST_MODE" != quiet ]]; then
+      warn 'nothing to fetch: this repository has no remote'
+    fi
+    return 0
+  fi
+
+  if ! out=$(git fetch --quiet "$remote" 2>&1); then
+    if [[ "$ST_MODE" != quiet ]]; then
+      warn "cannot fetch ${remote}; distances are as of the last fetch"
+      if [[ -n "$out" ]]; then
+        printf '%s\n' "$out" | relay
+      fi
+    fi
+  fi
+}
+
+# _st_rest_into VARIABLE N RECORD — RECORD without its first N space-separated
+# fields, which leaves the path even when the path holds spaces.
+_st_rest_into() {
+  local __sr_name="$1" __sr_n="$2" __sr_rest="$3"
+  while (( __sr_n > 0 )); do
+    __sr_rest="${__sr_rest#* }"
+    __sr_n=$(( __sr_n - 1 ))
+  done
+  printf -v "$__sr_name" '%s' "$__sr_rest"
+}
+
+# _st_add KIND XY SUB PATH — append one record and count it.
+_st_add() {
+  local i=${#ST_PATH[@]}
+
+  ST_KIND[i]="$1"
+  ST_XY[i]="$2"
+  ST_SUB[i]="$3"
+  ST_PATH[i]="$4"
+  ST_ORIG[i]=''
+  ST_EPOCH[i]=''
+  ST_BYTES[i]=''
+
+  case "$1" in
+    u)   ST_N_CONFLICT=$(( ST_N_CONFLICT + 1 )) ;;
+    '?') ST_N_UNTRACKED=$(( ST_N_UNTRACKED + 1 )) ;;
+    *)
+      if [[ "${2:0:1}" != '.' ]]; then
+        ST_N_STAGED=$(( ST_N_STAGED + 1 ))
+      fi
+      if [[ "${2:1:1}" != '.' ]]; then
+        ST_N_UNSTAGED=$(( ST_N_UNSTAGED + 1 ))
+      fi
+      ;;
+  esac
+}
+
+# _st_read — run git status once and parse it into the ST_* globals.
+#
+# Records are NUL-terminated, so paths arrive verbatim. A rename record is
+# followed by a second item holding the path it came from. --branch always
+# prints branch.oid, so its absence means git status itself failed.
+_st_read() {
+  local -a args=()
+  local rec path ab start want_orig=false
+
+  if [[ "$ST_MODE" == short ]]; then
+    # A prompt runs this constantly; it must not take index.lock from under an
+    # editor's own git process.
+    args+=(--no-optional-locks)
+  fi
+  args+=(status --porcelain=v2 --branch -z)
+  if [[ "$ST_MODE" != quiet ]]; then
+    args+=(--show-stash)
+  fi
+  if [[ "$ST_UNTRACKED" != true ]]; then
+    args+=(--untracked-files=no)
+  fi
+
+  ST_OID='' ST_HEAD='' ST_UPSTREAM='' ST_HAS_AB=false ST_AHEAD=0 ST_BEHIND=0
+  ST_STASH=0
+  ST_N_CONFLICT=0 ST_N_STAGED=0 ST_N_UNSTAGED=0 ST_N_UNTRACKED=0
+  ST_KIND=() ST_XY=() ST_SUB=() ST_PATH=() ST_ORIG=() ST_EPOCH=() ST_BYTES=()
+
+  start=$SECONDS
+  while IFS= read -r -d '' rec; do
+    if [[ "$want_orig" == true ]]; then
+      ST_ORIG[${#ST_PATH[@]} - 1]="$rec"
+      want_orig=false
+      continue
+    fi
+    case "$rec" in
+      '# branch.oid '*)      ST_OID="${rec##* }" ;;
+      '# branch.head '*)     ST_HEAD="${rec##* }" ;;
+      '# branch.upstream '*) ST_UPSTREAM="${rec##* }" ;;
+      '# branch.ab '*)
+        ST_HAS_AB=true
+        ab="${rec##*ab }"
+        ST_AHEAD="${ab%% *}"
+        ST_AHEAD="${ST_AHEAD#+}"
+        ST_BEHIND="${ab##* }"
+        ST_BEHIND="${ST_BEHIND#-}"
+        ;;
+      '# stash '*)           ST_STASH="${rec##* }" ;;
+      '1 '*)
+        # 1 XY sub mH mI mW hH hI path
+        _st_rest_into path 8 "$rec"
+        _st_add 1 "${rec:2:2}" "${rec:5:4}" "$path"
+        ;;
+      '2 '*)
+        # 2 XY sub mH mI mW hH hI Xscore path, then the original path
+        _st_rest_into path 9 "$rec"
+        _st_add 2 "${rec:2:2}" "${rec:5:4}" "$path"
+        want_orig=true
+        ;;
+      'u '*)
+        # u XY sub m1 m2 m3 mW h1 h2 h3 path
+        _st_rest_into path 10 "$rec"
+        _st_add u "${rec:2:2}" "${rec:5:4}" "$path"
+        ;;
+      '? '*)
+        _st_add '?' '??' 'N...' "${rec:2}"
+        ;;
+    esac
+  done < <(git "${args[@]}" -- ${ST_PATHS[@]+"${ST_PATHS[@]}"})
+  ST_SECONDS=$(( SECONDS - start ))
+
+  if [[ -z "$ST_OID" ]]; then
+    _st_fail 'git status failed'
+  fi
+}
+
+# _st_operation — the merge, rebase, cherry-pick, revert or bisect under way,
+# with a rebase's progress through its todo list and the branch it is
+# rebasing, since HEAD is detached until it finishes.
+_st_operation() {
+  local d="$ST_GITDIR" dir step='' end='' head=''
+
+  ST_OP=$(_sync_operation "$ST_GITDIR")
+  ST_OP_STEP=''
+  ST_OP_BRANCH=''
+  if [[ "$ST_OP" != 'rebase in progress' ]]; then
+    return 0
+  fi
+
+  if [[ -d "$d/rebase-merge" ]]; then
+    dir="$d/rebase-merge"
+    { IFS= read -r step <"$dir/msgnum"; } 2>/dev/null || true
+    { IFS= read -r end <"$dir/end"; } 2>/dev/null || true
+  else
+    dir="$d/rebase-apply"
+    { IFS= read -r step <"$dir/next"; } 2>/dev/null || true
+    { IFS= read -r end <"$dir/last"; } 2>/dev/null || true
+  fi
+  { IFS= read -r head <"$dir/head-name"; } 2>/dev/null || true
+
+  if [[ -n "$step" && -n "$end" ]]; then
+    ST_OP_STEP="${step} of ${end}"
+  fi
+  if [[ "$head" == refs/heads/* ]]; then
+    ST_OP_BRANCH="${head#refs/heads/}"
+  fi
+}
+
+# _st_base — the base branch and HEAD's distance from it, unless HEAD is the
+# base or has no commits to measure.
+_st_base() {
+  local counts
+
+  ST_BASE='' ST_BASE_AHEAD=0 ST_BASE_BEHIND=0
+  if [[ "$ST_OID" == '(initial)' ]]; then
+    return 0
+  fi
+
+  ST_BASE=$(base_ref)
+  if [[ -z "$ST_BASE" || "$ST_BASE" == "$ST_HEAD" ]]; then
+    ST_BASE=''
+    return 0
+  fi
+
+  counts=$(git rev-list --left-right --count "${ST_BASE}...HEAD" 2>/dev/null) ||
+    counts=''
+  if [[ -n "$counts" ]]; then
+    ST_BASE_BEHIND="${counts%%[[:space:]]*}"
+    ST_BASE_AHEAD="${counts##*[[:space:]]}"
+  fi
+}
+
+# _st_no_upstream — what to say about a branch with no upstream: whether its
+# name already exists on the remote, or how much of it exists nowhere else.
+_st_no_upstream() {
+  local only
+
+  ST_REMOTE_HAS_BRANCH=false
+  _st_pick_remote
+
+  if [[ -z "$ST_REMOTE" ]]; then
+    ST_NO_UPSTREAM='none (no remote)'
+  elif git rev-parse --verify --quiet "refs/remotes/${ST_REMOTE}/${ST_HEAD}" >/dev/null 2>&1; then
+    ST_REMOTE_HAS_BRANCH=true
+    ST_NO_UPSTREAM="none (${ST_REMOTE}/${ST_HEAD} exists but is not tracked)"
+  else
+    only=$(git rev-list --count HEAD --not --remotes 2>/dev/null) || only=''
+    case "$only" in
+      ''|0) ST_NO_UPSTREAM='none (not pushed)' ;;
+      1)    ST_NO_UPSTREAM='none (not pushed; 1 commit exists only here)' ;;
+      *)    ST_NO_UPSTREAM="none (not pushed; ${only} commits exist only here)" ;;
+    esac
+  fi
+}
+
+# _st_fetch_age — when the remote refs were last fetched, in ST_FETCHED, or 0.
+# FETCH_HEAD is per worktree, so a fetch from the main checkout leaves a linked
+# worktree's copy stale: the newer of the two is the honest answer.
+_st_fetch_age() {
+  local -a heads=()
+  local f date epoch bytes path
+
+  ST_FETCHED=0
+  for f in "$ST_GITDIR/FETCH_HEAD" "$ST_COMMONDIR/FETCH_HEAD"; do
+    if [[ -f "$f" ]]; then
+      heads+=("$f")
+    fi
+  done
+  if (( ${#heads[@]} == 0 )); then
+    return 0
+  fi
+
+  while IFS='|' read -r date epoch bytes path; do
+    if [[ "$epoch" =~ ^[0-9]+$ ]] && (( epoch > ST_FETCHED )); then
+      ST_FETCHED=$epoch
+    fi
+  done < <(stat "${UT_STAT[@]}" -- "${heads[@]}" 2>/dev/null || true)
+}
+
+# _st_stat — size and mtime of every changed path, from one batched stat like
+# g untracked's. stat prints nothing for a path that has gone, so its output is
+# walked alongside the records rather than matched by position.
+_st_stat() {
+  local n=${#ST_PATH[@]} j=0 date epoch bytes path
+
+  if (( n == 0 )); then
+    return 0
+  fi
+
+  while IFS='|' read -r date epoch bytes path; do
+    while (( j < n )) && [[ "${ST_PATH[$j]}" != "$path" ]]; do
+      j=$(( j + 1 ))
+    done
+    if (( j < n )); then
+      ST_EPOCH[j]="$epoch"
+      ST_BYTES[j]="$bytes"
+      j=$(( j + 1 ))
+    fi
+  done < <(
+    cd "$ST_ROOT" &&
+      printf '%s\0' "${ST_PATH[@]}" | xargs -0 stat "${UT_STAT[@]}" -- 2>/dev/null
+  ) || true
+}
+
+# _st_diffstats — a --shortstat line for the staged and the unstaged changes.
+# The unstaged diff names its files, when there are not too many to pass, so
+# git compares those rather than checking every tracked file a second time.
+_st_diffstats() {
+  local -a named=()
+  local i
+
+  ST_STAGED_STAT='' ST_UNSTAGED_STAT=''
+
+  if (( ST_N_STAGED > 0 )); then
+    ST_STAGED_STAT=$(git diff --cached --shortstat -- \
+      ${ST_PATHS[@]+"${ST_PATHS[@]}"} 2>/dev/null) || ST_STAGED_STAT=''
+  fi
+
+  if (( ST_N_UNSTAGED > 0 && ST_N_UNSTAGED <= 1000 )); then
+    for (( i = 0; i < ${#ST_PATH[@]}; i++ )); do
+      case "${ST_KIND[$i]}" in
+        1|2)
+          if [[ "${ST_XY[$i]:1:1}" != '.' ]]; then
+            named+=("${ST_PATH[$i]}")
+          fi
+          ;;
+      esac
+    done
+    ST_UNSTAGED_STAT=$(git -C "$ST_ROOT" --literal-pathspecs diff --shortstat -- \
+      "${named[@]}" 2>/dev/null) || ST_UNSTAGED_STAT=''
+  elif (( ST_N_UNSTAGED > 0 )); then
+    ST_UNSTAGED_STAT=$(git diff --shortstat -- \
+      ${ST_PATHS[@]+"${ST_PATHS[@]}"} 2>/dev/null) || ST_UNSTAGED_STAT=''
+  fi
+
+  ST_STAGED_STAT="${ST_STAGED_STAT# }"
+  ST_UNSTAGED_STAT="${ST_UNSTAGED_STAT# }"
+}
+
+# _st_change_into VARIABLE CODE — the word for one side of an XY code.
+_st_change_into() {
+  local __ch_word
+  case "$2" in
+    M) __ch_word='modified' ;;
+    T) __ch_word='type changed' ;;
+    A) __ch_word='added' ;;
+    D) __ch_word='deleted' ;;
+    R) __ch_word='renamed' ;;
+    C) __ch_word='copied' ;;
+    *) __ch_word="$2" ;;
+  esac
+  printf -v "$1" '%s' "$__ch_word"
+}
+
+# _st_conflict_into VARIABLE XY — the word for an unmerged path.
+_st_conflict_into() {
+  local __cf_word
+  case "$2" in
+    DD) __cf_word='both deleted' ;;
+    AU) __cf_word='added by us' ;;
+    UD) __cf_word='deleted by them' ;;
+    UA) __cf_word='added by them' ;;
+    DU) __cf_word='deleted by us' ;;
+    AA) __cf_word='both added' ;;
+    UU) __cf_word='both modified' ;;
+    *)  __cf_word="$2" ;;
+  esac
+  printf -v "$1" '%s' "$__cf_word"
+}
+
+# _st_submodule_into VARIABLE WORD SUB — WORD, or what changed inside a
+# submodule when the record is one: SUB is S<commit><modified><untracked>.
+_st_submodule_into() {
+  local __sm_name="$1" __sm_word="$2" __sm_sub="$3" __sm_out=''
+
+  if [[ "${__sm_sub:0:1}" != S ]]; then
+    printf -v "$__sm_name" '%s' "$__sm_word"
+    return 0
+  fi
+  if [[ "${__sm_sub:1:1}" == C ]]; then
+    __sm_out='new commits'
+  fi
+  if [[ "${__sm_sub:2:1}" == M ]]; then
+    __sm_out+="${__sm_out:+, }modified content"
+  fi
+  if [[ "${__sm_sub:3:1}" == U ]]; then
+    __sm_out+="${__sm_out:+, }untracked content"
+  fi
+  printf -v "$__sm_name" 'submodule: %s' "${__sm_out:-$__sm_word}"
+}
+
+# _st_row STYLE STATE CHANGE INDEX WITH_ORIGIN — one table row for a record.
+# SIZE and AGE describe the file on disk now, so a deleted row has neither, and
+# a directory — an untracked one, or a submodule — has no size.
+_st_row() {
+  local style="$1" state="$2" change="$3" i="$4" with_origin="$5"
+  local size='-' age='-' path orig arrow='->'
+
+  if [[ "$change" != deleted && -n "${ST_EPOCH[$i]}" ]]; then
+    if [[ "${ST_PATH[$i]}" != */ && "${ST_SUB[$i]:0:1}" != S ]]; then
+      _ut_human_bytes_into size "${ST_BYTES[$i]}"
+    fi
+    _st_ago_into age $(( ST_NOW - ST_EPOCH[i] ))
+  fi
+  printf -v size '%9s' "$size"
+
+  relpath_into path "${ST_ROOT}/${ST_PATH[$i]}"
+  if [[ "$with_origin" == true && -n "${ST_ORIG[$i]}" ]]; then
+    relpath_into orig "${ST_ROOT}/${ST_ORIG[$i]}"
+    if (( G_UNICODE )); then
+      arrow='→'
+    fi
+    path="${orig} ${arrow} ${path}"
+  fi
+
+  table_add_styled "$style" "$state" "$change" "$size" "$age" "$path"
+}
+
+# _st_table — every record as rows: conflicts, then staged, unstaged and
+# untracked. A file with both staged and unstaged changes is a row in each.
+_st_table() {
+  local i n=${#ST_PATH[@]} xy word
+
+  table_begin
+  table_add 'STATE' 'CHANGE' "$(printf '%9s' 'SIZE')" 'AGE' 'PATH'
+
+  for (( i = 0; i < n; i++ )); do
+    if [[ "${ST_KIND[$i]}" == u ]]; then
+      _st_conflict_into word "${ST_XY[$i]}"
+      _st_row "$C_RED" conflict "$word" "$i" false
+    fi
+  done
+
+  for (( i = 0; i < n; i++ )); do
+    case "${ST_KIND[$i]}" in
+      1|2) ;;
+      *) continue ;;
+    esac
+    xy="${ST_XY[$i]}"
+    if [[ "${xy:0:1}" != '.' ]]; then
+      _st_change_into word "${xy:0:1}"
+      _st_submodule_into word "$word" "${ST_SUB[$i]}"
+      _st_row "$C_GREEN" staged "$word" "$i" true
+    fi
+  done
+
+  for (( i = 0; i < n; i++ )); do
+    case "${ST_KIND[$i]}" in
+      1|2) ;;
+      *) continue ;;
+    esac
+    xy="${ST_XY[$i]}"
+    if [[ "${xy:1:1}" != '.' ]]; then
+      _st_change_into word "${xy:1:1}"
+      # A worktree-side "added" only comes from `git add -N`.
+      if [[ "$word" == added ]]; then
+        word='intent to add'
+      fi
+      _st_submodule_into word "$word" "${ST_SUB[$i]}"
+      _st_row "$C_YELLOW" unstaged "$word" "$i" false
+    fi
+  done
+
+  for (( i = 0; i < n; i++ )); do
+    if [[ "${ST_KIND[$i]}" == '?' ]]; then
+      if [[ "${ST_PATH[$i]}" == */ ]]; then
+        word='new directory'
+      else
+        word='new file'
+      fi
+      _st_row '' untracked "$word" "$i" false
+    fi
+  done
+
+  table_flush
+}
+
+# _st_hints — at most two next steps: first whatever is under way, then the
+# branch against its upstream.
+_st_hints() {
+  local -a hints=()
+  local go='' stop='' remote i
+
+  case "$ST_OP" in
+    'rebase in progress')      go='git rebase --continue'      stop='git rebase --abort' ;;
+    'merge in progress')       go='git commit'                 stop='git merge --abort' ;;
+    'cherry-pick in progress') go='git cherry-pick --continue' stop='git cherry-pick --abort' ;;
+    'revert in progress')      go='git revert --continue'      stop='git revert --abort' ;;
+  esac
+
+  if [[ "$ST_OP" == 'bisect in progress' ]]; then
+    hints+=('Mark this commit with git bisect good or bad; finish with git bisect reset')
+  elif (( ST_N_CONFLICT > 0 )); then
+    if [[ -n "$go" ]]; then
+      hints+=("Resolve the conflicts, git add each file, then ${go}")
+    else
+      hints+=('Resolve the conflicts, then git add each file')
+    fi
+  elif [[ -n "$go" ]] && (( ${#ST_PATHS[@]} )) &&
+    [[ -n "$(git -C "$ST_ROOT" ls-files --unmerged 2>/dev/null)" ]]; then
+    # PATHs hid the conflicts from the status, but not from the index.
+    hints+=("Conflicts remain outside these paths; resolve them, then ${go}")
+  elif [[ -n "$go" ]]; then
+    hints+=("Finish with: ${go}  (or ${stop})")
+  fi
+
+  if [[ -z "$ST_OP" && "$ST_HEAD" != '(detached)' && "$ST_OID" != '(initial)' ]]; then
+    if [[ -z "$ST_UPSTREAM" ]]; then
+      if [[ "$ST_REMOTE_HAS_BRANCH" == true ]]; then
+        hints+=("Track it with: git branch -u ${ST_REMOTE}/${ST_HEAD}")
+      elif [[ -n "$ST_REMOTE" ]]; then
+        hints+=("Publish with: git push -u ${ST_REMOTE} ${ST_HEAD}")
+      fi
+    elif [[ "$ST_HAS_AB" != true ]]; then
+      remote="${ST_UPSTREAM%%/*}"
+      hints+=("Push again with git push -u ${remote} ${ST_HEAD}, or forget it with git branch --unset-upstream")
+    elif (( ST_AHEAD > 0 && ST_BEHIND > 0 )); then
+      hints+=("Reconcile with: git pull --rebase  (or git merge ${ST_UPSTREAM})")
+    elif (( ST_BEHIND > 0 )); then
+      hints+=('Update with: git pull --ff-only')
+    elif (( ST_AHEAD > 0 )); then
+      hints+=('Push with: git push')
+    fi
+  fi
+
+  if (( ${#hints[@]} == 0 )); then
+    return 0
+  fi
+  printf '\n'
+  for (( i = 0; i < ${#hints[@]} && i < 2; i++ )); do
+    muted "${hints[$i]}"
+  done
+}
+
+# _st_advice — when git status was slow, say which settings would fix it. Only
+# advice: the configuration is the user's to change.
+_st_advice() {
+  local limit="${G_STATUS_SLOW:-2}" key val fsm='' utc='' many=''
+  local fsm_on=false utc_on=false native=false
+
+  if ! [[ "$limit" =~ ^[0-9]+$ ]]; then
+    limit=2
+  fi
+  if (( ST_SECONDS < limit )); then
+    return 0
+  fi
+
+  while IFS=' ' read -r key val; do
+    case "$key" in
+      core.fsmonitor)      fsm="${val:-true}" ;;
+      core.untrackedcache) utc="${val:-true}" ;;
+      feature.manyfiles)   many="${val:-true}" ;;
+    esac
+  done < <(git config --get-regexp \
+    '^(core\.(fsmonitor|untrackedcache)|feature\.manyfiles)$' 2>/dev/null || true)
+
+  # git booleans ignore case; a non-boolean core.fsmonitor names a hook.
+  shopt -s nocasematch
+  case "$fsm" in
+    ''|false|no|off|0) ;;
+    *) fsm_on=true ;;
+  esac
+  case "$utc" in
+    true|yes|on|1) utc_on=true ;;
+    false|no|off|0) ;;
+    *)
+      case "$many" in
+        true|yes|on|1) utc_on=true ;;
+      esac
+      ;;
+  esac
+  shopt -u nocasematch
+
+  # The built-in fsmonitor daemon exists on macOS and Windows only.
+  case "$(uname)" in
+    Darwin|MINGW*|MSYS*|CYGWIN*) native=true ;;
+  esac
+  if [[ "$ST_UNTRACKED" != true ]]; then
+    utc_on=true
+  fi
+
+  local -a fixes=()
+  if [[ "$fsm_on" != true && "$native" == true ]]; then
+    fixes+=('git config core.fsmonitor true')
+  fi
+  if [[ "$utc_on" != true ]]; then
+    fixes+=('git config core.untrackedCache true')
+  fi
+
+  warn "git status took about ${ST_SECONDS} seconds here"
+  if [[ "$fsm_on" == true && "$utc_on" == true ]]; then
+    detail 'core.fsmonitor and core.untrackedCache are already on.'
+  fi
+  if [[ "$fsm_on" != true ]]; then
+    detail 'core.fsmonitor is off, so git checks every tracked file for changes.'
+    if [[ "$native" != true ]]; then
+      detail 'On this platform it needs a hook, such as Watchman, rather than true.'
+    fi
+  fi
+  if [[ "$utc_on" != true ]]; then
+    detail 'core.untrackedCache is off, so git searches every directory for new files.'
+  fi
+  if (( ${#fixes[@]} )); then
+    detail 'Turn on for this repository with:'
+    for key in "${fixes[@]}"; do
+      detail "  ${key}"
+    done
+    detail 'The first run after that is still slow while git fills its caches.'
+  fi
+  if [[ "$ST_UNTRACKED" == true ]]; then
+    detail 'Faster now: -U skips untracked files, and a PATH limits the walk to it.'
+  fi
+  printf '\n' >&2
+}
+
+# _st_short — the one-line form, for a prompt.
+_st_short() {
+  local line tok word up='↑' down='↓'
+
+  if (( ! G_UNICODE )); then
+    up='^'
+    down='v'
+  fi
+
+  if [[ -n "$ST_OP_BRANCH" ]]; then
+    paint_into line "$C_BOLD" "$ST_OP_BRANCH"
+  elif [[ "$ST_HEAD" == '(detached)' ]]; then
+    paint_into line "$C_YELLOW" "(detached ${ST_OID:0:7})"
+  else
+    paint_into line "$C_BOLD" "$ST_HEAD"
+  fi
+
+  if [[ -n "$ST_OP" ]]; then
+    word="${ST_OP%% *}"
+    if [[ -n "$ST_OP_STEP" ]]; then
+      word+=" ${ST_OP_STEP// of //}"
+    fi
+    paint_into tok "$C_RED" "(${word})"
+    line+=" ${tok}"
+  fi
+
+  if [[ "$ST_HEAD" != '(detached)' && "$ST_OID" != '(initial)' ]]; then
+    if [[ -z "$ST_UPSTREAM" ]]; then
+      paint_into tok "$C_YELLOW" '(no upstream)'
+      line+=" ${tok}"
+    elif [[ "$ST_HAS_AB" != true ]]; then
+      paint_into tok "$C_YELLOW" '(gone)'
+      line+=" ${tok}"
+    else
+      if (( ST_AHEAD > 0 )); then
+        paint_into tok "$C_CYAN" "${up}${ST_AHEAD}"
+        line+=" ${tok}"
+      fi
+      if (( ST_BEHIND > 0 )); then
+        paint_into tok "$C_CYAN" "${down}${ST_BEHIND}"
+        line+=" ${tok}"
+      fi
+    fi
+  fi
+
+  if (( ST_N_CONFLICT > 0 )); then
+    paint_into tok "$C_RED" "=${ST_N_CONFLICT}"
+    line+=" ${tok}"
+  fi
+  if (( ST_N_STAGED > 0 )); then
+    paint_into tok "$C_GREEN" "+${ST_N_STAGED}"
+    line+=" ${tok}"
+  fi
+  if (( ST_N_UNSTAGED > 0 )); then
+    paint_into tok "$C_YELLOW" "!${ST_N_UNSTAGED}"
+    line+=" ${tok}"
+  fi
+  if (( ST_N_UNTRACKED > 0 )); then
+    line+=" ?${ST_N_UNTRACKED}"
+  fi
+  if (( ST_STASH > 0 )); then
+    paint_into tok "$C_DIM" "\$${ST_STASH}"
+    line+=" ${tok}"
+  fi
+
+  printf '%s\n' "$line"
+}
+
+# _st_report — the full report on stdout.
+_st_report() {
+  local v tok parts distance
+
+  section 'Status'
+
+  if [[ "$ST_HEAD" == '(detached)' ]]; then
+    paint_into v "$C_YELLOW" "detached at ${ST_OID:0:7}"
+  else
+    paint_into v "$C_BOLD" "$ST_HEAD"
+    if [[ "$ST_OID" == '(initial)' ]]; then
+      v+=' (no commits yet)'
+    fi
+  fi
+  kv 'Branch' "$v"
+
+  if [[ "$ST_HEAD" != '(detached)' && "$ST_OID" != '(initial)' ]]; then
+    if [[ -z "$ST_UPSTREAM" ]]; then
+      paint_into v "$C_YELLOW" "$ST_NO_UPSTREAM"
+    elif [[ "$ST_HAS_AB" != true ]]; then
+      paint_into v "$C_YELLOW" "${ST_UPSTREAM} (gone from the remote)"
+    else
+      _st_distance_into distance "$ST_AHEAD" "$ST_BEHIND" 'in sync'
+      v="${ST_UPSTREAM} (${distance})"
+    fi
+    kv 'Upstream' "$v"
+  fi
+
+  if [[ -n "$ST_BASE" ]]; then
+    _st_distance_into distance "$ST_BASE_AHEAD" "$ST_BASE_BEHIND" 'same commit'
+    kv 'Base' "${ST_BASE} (${distance})"
+  fi
+
+  if (( ST_FETCHED > 0 )); then
+    _st_ago_into v $(( ST_NOW - ST_FETCHED ))
+    kv 'Fetched' "$v"
+  elif [[ -n "$ST_UPSTREAM" ]]; then
+    kv 'Fetched' 'not since the clone'
+  fi
+
+  v="$ST_ROOT"
+  if [[ "$ST_LINKED" == true ]]; then
+    v+=' (linked worktree)'
+  fi
+  kv 'Worktree' "$v"
+
+  if [[ -n "$ST_OP" ]]; then
+    v="$ST_OP"
+    if [[ -n "$ST_OP_BRANCH" ]]; then
+      v="rebase of ${ST_OP_BRANCH} in progress"
+    fi
+    if [[ -n "$ST_OP_STEP" ]]; then
+      v+=", step ${ST_OP_STEP}"
+    fi
+    paint_into v "$C_RED" "$v"
+    kv 'State' "$v"
+  fi
+
+  if (( ST_STASH == 1 )); then
+    kv 'Stash' '1 entry'
+  elif (( ST_STASH > 1 )); then
+    kv 'Stash' "${ST_STASH} entries"
+  fi
+
+  if (( ${#ST_PATHS[@]} )); then
+    kv 'Paths' "${ST_PATHS[*]}"
+  fi
+
+  parts=''
+  if (( ST_N_CONFLICT == 1 )); then
+    paint_into tok "$C_RED" '1 conflict'
+    parts+="$tok"
+  elif (( ST_N_CONFLICT > 1 )); then
+    paint_into tok "$C_RED" "${ST_N_CONFLICT} conflicts"
+    parts+="$tok"
+  fi
+  if (( ST_N_STAGED > 0 )); then
+    paint_into tok "$C_GREEN" "${ST_N_STAGED} staged"
+    parts+="${parts:+, }${tok}"
+  fi
+  if (( ST_N_UNSTAGED > 0 )); then
+    paint_into tok "$C_YELLOW" "${ST_N_UNSTAGED} unstaged"
+    parts+="${parts:+, }${tok}"
+  fi
+  if (( ST_N_UNTRACKED > 0 )); then
+    parts+="${parts:+, }${ST_N_UNTRACKED} untracked"
+  fi
+  if [[ -z "$parts" ]]; then
+    paint_into parts "$C_GREEN" 'clean'
+  fi
+  if [[ "$ST_UNTRACKED" != true ]]; then
+    parts+="; untracked files not checked${ST_UNTRACKED_WHY}"
+  fi
+  kv 'Changes' "$parts"
+
+  if [[ -n "$ST_STAGED_STAT" ]]; then
+    kv 'Staged diff' "$ST_STAGED_STAT"
+  fi
+  if [[ -n "$ST_UNSTAGED_STAT" ]]; then
+    kv 'Unstaged diff' "$ST_UNSTAGED_STAT"
+  fi
+
+  if (( ${#ST_PATH[@]} > 0 )); then
+    printf '\n'
+    _st_table
+  fi
+
+  _st_hints
+  printf '\n'
+}
+
+st_usage() {
+  section "g status — where you are and what has changed"
+
+  cat <<'EOF'
+Usage:
+  g status [options] [PATH...]
+
+A report on the working tree: the branch, its distance from the upstream and
+from the base branch, when the remote was last fetched, the worktree, any
+merge or rebase in progress, the stash, and every changed file as a conflict,
+staged, unstaged or untracked, with its size and age on disk.
+
+The whole repository is covered. PATHs narrow the report to a pathspec, which
+also narrows git's search for untracked files, the slow part in a large
+repository.
+
+When git status takes 2 seconds or more, a warning names the settings that
+would make it faster and prints the git config lines that turn them on. It
+never changes the configuration itself.
+
+Options:
+  -s, --short          One line, for a prompt: branch, distance and counts
+  -q, --quiet          Print nothing; exit 0 when clean, 1 when there are
+                       changes, 2 when the status cannot be read
+  -U, --no-untracked   Do not look for untracked files
+  -f, --fetch          Fetch from the remote first, so distances are current
+  -h, --help           Show this help
+
+Short form:
+  ↑N ↓N          commits ahead of and behind the upstream (^N vN without UTF-8)
+  =N  +N  !N  ?N conflicts, staged, unstaged and untracked files
+  $N             stash entries
+  (no upstream), (gone), (rebase 3/7) and the like when they apply
+
+Environment:
+  G_STATUS_SLOW  Seconds before the speed warning appears (default 2)
+EOF
+
+  printf '\n'
+}
+
+cmd_status() {
+  ST_MODE=report
+  ST_UNTRACKED=true
+  ST_UNTRACKED_WHY=''
+  ST_FETCH=false
+  ST_PATHS=()
+
+  while (( $# )); do
+    case "$1" in
+      -h|--help)
+        st_usage
+        return 0
+        ;;
+      -s|--short)
+        if [[ "$ST_MODE" == quiet ]]; then
+          _st_fail '-s and -q cannot be combined'
+        fi
+        ST_MODE=short
+        shift
+        ;;
+      -q|--quiet)
+        if [[ "$ST_MODE" == short ]]; then
+          # Exit 2 whichever came first: under -q, 1 would read as "dirty".
+          ST_MODE=quiet
+          _st_fail '-s and -q cannot be combined'
+        fi
+        ST_MODE=quiet
+        shift
+        ;;
+      -U|--no-untracked)
+        ST_UNTRACKED=false
+        ST_UNTRACKED_WHY=' (-U)'
+        shift
+        ;;
+      -f|--fetch)
+        ST_FETCH=true
+        shift
+        ;;
+      --)
+        shift
+        if (( $# )); then
+          ST_PATHS+=("$@")
+        fi
+        break
+        ;;
+      -[!-]?*)
+        local flags="${1#-}"
+        local -a split=()
+        shift
+        while [[ -n "$flags" ]]; do
+          split[${#split[@]}]="-${flags:0:1}"
+          flags="${flags:1}"
+        done
+        set -- "${split[@]}" "$@"
+        ;;
+      -*)
+        _st_fail "unknown option: $1"
+        ;;
+      *)
+        ST_PATHS+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  if ! command -v git >/dev/null 2>&1; then
+    _st_fail 'git is not installed or not on PATH'
+  fi
+  _st_locate
+
+  # git honours status.showUntrackedFiles on its own; the report only needs
+  # to know, so it can say the untracked count was never taken.
+  if [[ "$ST_MODE" == report && "$ST_UNTRACKED" == true ]]; then
+    case "$(git config --get status.showUntrackedFiles 2>/dev/null || true)" in
+      no|false|off|0)
+        ST_UNTRACKED=false
+        ST_UNTRACKED_WHY=' (status.showUntrackedFiles=no)'
+        ;;
+    esac
+  fi
+
+  if [[ "$ST_FETCH" == true ]]; then
+    _st_fetch
+  fi
+  _st_read
+
+  case "$ST_MODE" in
+    quiet)
+      if (( ST_N_CONFLICT + ST_N_STAGED + ST_N_UNSTAGED + ST_N_UNTRACKED > 0 )); then
+        return 1
+      fi
+      return 0
+      ;;
+    short)
+      _st_operation
+      _st_short
+      return 0
+      ;;
+  esac
+
+  _st_operation
+  _st_base
+  if [[ -z "$ST_UPSTREAM" && "$ST_HEAD" != '(detached)' && "$ST_OID" != '(initial)' ]]; then
+    _st_no_upstream
+  fi
+  _st_fetch_age
+  ST_NOW=$(date +%s)
+  _st_stat
+  _st_diffstats
+
+  _st_report
+  _st_advice
+}
+
 # ── g branch-summary ────────────────────────────────────────────────────────
 # Ported from ~/bitbucket/pftylr/utils/git/git-branch-summary.
 
@@ -4232,6 +5262,7 @@ Commands:
   grep                git grep here, or across every indexed repository
   log                 The whole history, commit by commit
   repos               List the repositories g has been run in
+  status              Branch, upstream and every changed file, as one report
   sync                Commit, update and push one cached repository
   untracked           List untracked files with size and age
   gc                  Reclaim space in the repository
@@ -4294,6 +5325,9 @@ run_cmd() {
       ;;
     repos)
       cmd_repos "$@"
+      ;;
+    status)
+      cmd_status "$@"
       ;;
     untracked)
       cmd_untracked "$@"

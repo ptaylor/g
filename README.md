@@ -36,6 +36,7 @@ g version
 | `g branch-log` | The commits this branch adds, with their changes |
 | `g contributors`, `g who` | Who has written this repository, by number of commits |
 | `g repos` | List the repositories g has been run in |
+| `g status` | Branch, upstream and every changed file, as one report |
 | `g sync` | Commit, update and push one cached repository |
 | `g untracked` | List untracked files with size and age |
 | `g gc` | Reclaim space in the repository |
@@ -376,6 +377,113 @@ and prefixed with its name.
 
 `-n` stops after the report; `-y` skips the question. Without a terminal to ask
 on it refuses rather than assuming yes.
+
+## `g status`
+
+Where you are and what has changed, on one screen. New rather than ported:
+there is no status script among the originals.
+
+```bash
+g status              # the whole repository
+g status services/api # only these paths, which is also faster
+g status -U           # skip the search for untracked files
+g status -f           # fetch first, so the distances are current
+g status -s           # one line, for a prompt
+g status -q           # no output: exit 0 clean, 1 dirty, 2 error
+```
+
+```
+Status
+──────
+Branch           feature/order-totals
+Upstream         origin/feature/order-totals (2 ahead)
+Base             main (2 ahead)
+Fetched          2 hours ago
+Worktree         /Users/paul/work/api
+Stash            1 entry
+Changes          2 staged, 1 unstaged, 1 untracked
+Staged diff      2 files changed, 2 insertions(+)
+Unstaged diff    1 file changed, 1 insertion(+)
+
+STATE      CHANGE         SIZE  AGE         PATH
+─────────  ────────  ─────────  ──────────  ─────────────────────────────────────
+staged     renamed         4 B  12 min ago  ../docs/setup.md → ../docs/install.md
+staged     modified       45 B  3 min ago   main.go
+unstaged   modified       45 B  3 min ago   main.go
+untracked  new file    1.7 KiB  1 day ago   handlers/orders_test.go
+
+Push with: git push
+```
+
+What it adds to `git status`:
+
+- **A branch with no upstream is called out.** `git status` says nothing about
+  it; `g status` says `none (not pushed; 2 commits exist only here)`, or that
+  the remote has a branch of the same name you are not tracking.
+- **Distance from the base branch** as well as from the upstream. The base is
+  the first of `main`, `master`, `develop`, as in `g branches`.
+- **How old the distances are.** `Fetched` is the age of `FETCH_HEAD` — the
+  newer of the worktree's own and the main checkout's, since git keeps one per
+  worktree. Nothing is fetched unless you pass `-f`.
+- **What is under way.** A merge, cherry-pick, revert or bisect is named; a
+  rebase shows the branch and the step, `rebase of topic in progress, step 3 of 7`.
+- **Size and age on disk** for each file, so a stray probe file from yesterday
+  stands out from today's work. Deleted files show `-` for both; directories
+  have an age but no size.
+- **One or two next steps** instead of git's set of hints: finish the rebase,
+  publish the branch, pull, push.
+
+A file with both staged and unstaged changes is a row in each group. Paths are
+relative to the current directory. Untracked directories are collapsed the way
+`git status` collapses them, and `status.showUntrackedFiles=no` is honoured and
+reported as `untracked files not checked`.
+
+### When `git status` is slow
+
+`g status` runs `git status --porcelain=v2` once and times it, because the
+porcelain format never prints git's "It took 9.27 seconds to enumerate
+untracked files" advice. From 2 seconds (`G_STATUS_SLOW` changes the
+threshold) it adds a warning on stderr that names the settings that are off:
+
+```
+! git status took about 9 seconds here
+  core.fsmonitor is off, so git checks every tracked file for changes.
+  core.untrackedCache is off, so git searches every directory for new files.
+  Turn on for this repository with:
+    git config core.fsmonitor true
+    git config core.untrackedCache true
+  The first run after that is still slow while git fills its caches.
+  Faster now: -U skips untracked files, and a PATH limits the walk to it.
+```
+
+It never changes the configuration itself. `feature.manyFiles=true` counts as
+turning on the untracked cache. On Linux the built-in fsmonitor daemon is not
+available, so the warning says a hook such as Watchman is needed instead of
+printing a command that would fail.
+
+The unstaged line count names the changed files to `git diff` rather than
+letting it check every tracked file a second time (up to 1,000 files; past that
+it diffs the whole tree).
+
+### `-s`, the short form
+
+```
+feature/order-totals ↑2 +2 !1 ?1 $1
+```
+
+| Mark | Meaning |
+| --- | --- |
+| `↑N` `↓N` | Commits ahead of and behind the upstream (`^N` `vN` outside UTF-8) |
+| `=N` | Conflicts |
+| `+N` | Staged changes |
+| `!N` | Unstaged changes |
+| `?N` | Untracked files |
+| `$N` | Stash entries |
+| `(no upstream)`, `(gone)` | The branch tracks nothing, or its upstream was deleted |
+| `(rebase 3/7)`, `(merge)` | An operation in progress |
+
+The short form runs git with `--no-optional-locks`, so a prompt never takes
+`index.lock` from an editor's git process.
 
 ## `g untracked`
 
