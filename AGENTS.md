@@ -151,10 +151,12 @@ Rules:
   codes of the original script in `~/bitbucket/pftylr/utils/git`; record any
   intentional deviation in the commit body and in the command's help. Known
   deviations: `worktree -c/--check` is `g wt -s/--status`; `g gc` measures the
-  git directory rather than the working tree, and neither expires the reflog
-  nor repacks aggressively unless asked, because the original did both
-  unconditionally; `g branches -m` also hides the base branch and the current
-  one, which the original listed even though git cannot delete either;
+  git directory rather than the working tree, neither expires the reflog nor
+  repacks aggressively unless asked, because the original did both
+  unconditionally, and asks git for cruft packs so unreachable objects are not
+  unpacked back into loose ones; `g branches -m` also hides the base branch and
+  the current one, which the original listed even though git cannot delete
+  either;
   `g untracked` batches `stat`, marks ignored files and shows paths relative to
   the current directory rather than stripping the repository root;
   `g branch-summary` only accepts base branches HEAD already contains, so a

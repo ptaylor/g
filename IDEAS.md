@@ -50,6 +50,17 @@ branches, painful at two hundred. Measure on a synthetic repository before
 optimising; `for-each-ref`'s ahead-behind atom would collapse most of it, but it
 needs git 2.41.
 
+### `g gc` cannot say why the repository grew
+
+Asking git for cruft packs removed the usual cause — unreachable objects being
+unpacked back into loose ones — but growth is still printed in red as if
+something had gone wrong, and it can be perfectly ordinary: three loose objects
+become a pack that is bigger than they were, or a commit lands between the two
+measurements. `git count-objects -v` already reports loose bytes and packed
+bytes separately, so the line could say which half moved, and the hint could
+name the one case where the answer is a decision rather than an accident:
+unreachable objects git is keeping until they age out, which `-p` drops.
+
 ## Polish
 
 ### `g repos --prune`

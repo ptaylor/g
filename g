@@ -5014,6 +5014,12 @@ What `git gc` already does, so g does not repeat it:
   entries (90 days, 30 for unreachable ones), drops unreachable objects older
   than two weeks, and prunes worktree registrations missing for three months.
 
+Unreachable objects younger than that expiry are kept. Left alone, git unpacks
+them back into loose objects when it repacks, where they compress far worse than
+in a pack, so a collection can make the repository grow. g asks for cruft packs
+(gc.cruftPacks=true) unless you have set gc.cruftPacks yourself, which keeps
+them compressed until they expire; -p drops them now.
+
 Other cleanup git offers, which g leaves alone:
   git clean -fdx        delete untracked and ignored files in the worktree
   git worktree remove   remove another checkout
@@ -5075,13 +5081,24 @@ cmd_gc() {
   kv 'Repository' "$top"
   kv 'Before' "$(paint "$C_BOLD" "$(_gc_human_kb "$before_kb")")  ($(_gc_counts))"
 
-  local -a gc_args=(gc)
+  # Unreachable objects younger than the prune expiry are kept. Without cruft
+  # packs, repacking writes them back out as loose objects, where they lose the
+  # delta compression they had in the pack — a collection can then grow the
+  # repository. Git before 2.37 ignores the setting, which is harmless.
+  local -a git_args=(git)
+  if [[ -z "$(git config --get gc.cruftPacks 2>/dev/null || true)" ]]; then
+    git_args[${#git_args[@]}]=-c
+    git_args[${#git_args[@]}]=gc.cruftPacks=true
+  fi
+
+  local -a gc_args=("${git_args[@]}" gc)
   if [[ "$GC_AGGRESSIVE" == "true" ]]; then
     gc_args[${#gc_args[@]}]='--aggressive'
   fi
   if [[ "$GC_PRUNE_NOW" == "true" ]]; then
     gc_args[${#gc_args[@]}]='--prune=now'
   fi
+  local -a maintenance_args=("${git_args[@]}" maintenance run)
 
   if [[ "$GC_DRY_RUN" == "true" ]]; then
     printf '\n'
@@ -5093,9 +5110,9 @@ cmd_gc() {
       printf '  %s\n' 'git reflog expire --expire=now --all'
     fi
     if [[ "$GC_MAINTENANCE" == "true" ]]; then
-      printf '  %s\n' 'git maintenance run'
+      printf '  %s\n' "${maintenance_args[*]}"
     else
-      printf '  %s\n' "git ${gc_args[*]}"
+      printf '  %s\n' "${gc_args[*]}"
     fi
     printf '\n'
     muted 'Nothing was changed.'
@@ -5135,9 +5152,9 @@ cmd_gc() {
   fi
   if [[ "$GC_MAINTENANCE" == "true" ]]; then
     _gc_step 'maintenance run complete' 'maintenance run failed' \
-      git maintenance run
+      "${maintenance_args[@]}"
   else
-    _gc_step "$desc" 'garbage collection failed' git "${gc_args[@]}"
+    _gc_step "$desc" 'garbage collection failed' "${gc_args[@]}"
   fi
 
   printf '\n'
