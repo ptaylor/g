@@ -703,16 +703,86 @@ _wt_existing_for_branch() {
   '
 }
 
+# _wt_relocate_out_of_layout BRANCH PATH TARGET — bring a worktree made by the
+# flat layout into the tree layout. The repository changed layouts, so every
+# command reports paths from the layout now in use; moving the checkout keeps
+# its uncommitted work, which recreating it would not. The main checkout is
+# never moved.
+_wt_relocate_out_of_layout() {
+  local branch="$1" path="$2" target="$3" out parent
+
+  if [[ "$path" == "$WT_REPO_ROOT" ]]; then
+    return 0
+  fi
+
+  # Moving the main checkout leaves a linked worktree's .git link pointing at
+  # the old place; git worktree move refuses until git worktree repair has
+  # put it back.
+  if ! git -C "$path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    info "repairing the worktree for '${branch}' at $(relpath "$path")"
+    out=$(git worktree repair "$path" 2>&1) || true
+    if ! git -C "$path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      printf '\n' >&2
+      err "the worktree for '${branch}' at $(relpath "$path") cannot be repaired"
+      if [[ -n "$out" ]]; then
+        printf '%s\n' "$out" | relay
+      fi
+      printf '\n' >&2
+      printf 'Repair it by hand, then try again:\n\n  git worktree repair %s\n' \
+        "$(relpath "$path")" >&2
+      printf '\n' >&2
+      return 1
+    fi
+  fi
+
+  # git worktree move does not create missing parent directories, and a
+  # branch such as feature/a needs them.
+  parent=$(dirname "$target")
+  if [[ ! -d "$parent" ]] && ! mkdir -p "$parent" 2>/dev/null; then
+    err "cannot create $(relpath "$parent") for the worktree"
+    return 1
+  fi
+
+  info "moving the worktree for '${branch}' into the tree layout"
+  if ! out=$(git worktree move "$path" "$target" 2>&1); then
+    _wt_prune_empty_parents "$target"
+    printf '\n' >&2
+    err "cannot move the worktree for '${branch}' to $(relpath "$target")"
+    printf '%s\n' "$out" | relay
+    printf '\n' >&2
+    printf 'Move it by hand, then try again:\n\n  git worktree move %s %s\n' \
+      "$(relpath "$path")" "$(relpath "$target")" >&2
+    printf '\n' >&2
+    return 1
+  fi
+  if [[ -n "$out" ]]; then
+    printf '%s\n' "$out" | relay
+  fi
+  return 0
+}
+
 # Like _wt_existing_for_branch, but forgets registrations whose directory has
-# been deleted — printing a path that no longer exists helps nobody.
+# been deleted — printing a path that no longer exists helps nobody — and, in
+# a tree layout, brings a checkout left elsewhere by the flat layout into the
+# tree before reporting it.
 _wt_usable_for_branch() {
-  local path
-  path=$(_wt_existing_for_branch "$1")
+  local branch="$1" path canonical
+
+  path=$(_wt_existing_for_branch "$branch")
   if [[ -n "$path" && ! -d "$path" ]]; then
-    info "pruning stale worktree entry for '$1'"
+    info "pruning stale worktree entry for '${branch}'"
     git worktree prune
     path=''
   fi
+
+  if [[ -n "$path" && "$WT_LAYOUT" == "tree" ]]; then
+    canonical=$(_wt_path_for_branch "$branch")
+    if [[ "$path" != "$canonical" ]]; then
+      _wt_relocate_out_of_layout "$branch" "$path" "$canonical" || return 1
+      path="$canonical"
+    fi
+  fi
+
   printf '%s\n' "$path"
 }
 
@@ -1439,6 +1509,10 @@ Layout:
   In a tree layout the command also works from the directory that holds the
   checkouts, which is not itself a worktree: it finds the repository there and
   prints paths relative to wherever it was run.
+
+  A worktree left outside the tree layout, such as one made before the
+  repository changed layout, is moved into place the first time the command
+  opens it. Its uncommitted work is kept, and a stale .git link is repaired.
 
 The worktree path is printed on stdout and everything else on stderr, so
 `cd "$(g wt feature/thing)"` works.

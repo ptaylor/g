@@ -622,6 +622,12 @@ git never allows a branch to be a prefix of another: `feature` and `feature/a`
 cannot both exist, so their directories cannot collide. Removing a nested
 worktree also removes the empty branch directories it leaves behind.
 
+A worktree left outside the current layout — one made before the repository
+moved into the tree layout, say — is moved into place the first time `wt` opens
+it, so its uncommitted work survives rather than being recreated elsewhere. If
+its `.git` link still points at a main checkout that has since moved, it is
+repaired first.
+
 `g wt` also works from the repository directory itself, which holds the
 checkouts but is not a worktree. It finds the main checkout there and reports
 paths relative to that directory, so `cd "$(g wt feature/login)"` still lands

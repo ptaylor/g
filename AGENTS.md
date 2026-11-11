@@ -180,9 +180,12 @@ Rules:
   `g.worktreeLayout=flat|tree` overrides; `g clone` creates the tree layout
   and records the setting. Running `g wt` from the tree repository directory
   itself also works: it resolves the main checkout from there, and path output
-  stays relative to that directory. Every path is derived in
-  `_wt_path_for_branch`; a new command must go through it rather than joining
-  names itself.
+  stays relative to that directory. A worktree found outside the tree layout is
+  repaired and moved into it by `_wt_relocate_out_of_layout` before it is
+  reported, rather than rejected or recreated; `git worktree move` does not
+  create missing parent directories, so the target's parent is made first.
+  Every path is derived in `_wt_path_for_branch`; a new command must go through
+  it rather than joining names itself.
 - **No fork per row.** A loop over repository contents must not use command
   substitution or `read` on a herestring per item — both cost a process or a
   temporary file each. Assign with the `*_into` helpers (`relpath_into`,
