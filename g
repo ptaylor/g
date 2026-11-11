@@ -125,17 +125,26 @@ _plural() {
 # so a loop over thousands of files does not fork or touch the disk per file.
 _REL_CACHE_PWD=''
 _REL_CACHE_FROM=''
+# Set when a command resolves a repository from the directory it was run in
+# rather than by being inside one, as `g wt` does from a tree-layout
+# repository directory. Paths printed must stay relative to where the user is,
+# not to wherever the command moved itself.
+G_REL_BASE=''
 
 relpath_into() {
   local __rp_name="$1" __rp_target="$2"
   local __rp_from __rp_out='' __rp_t __rp_f __rp_tc __rp_fc
   local __rp_ups __rp_rest __rp_i
 
-  if [[ -z "$_REL_CACHE_FROM" || "$_REL_CACHE_PWD" != "$PWD" ]]; then
-    _REL_CACHE_FROM=$(pwd -P)
-    _REL_CACHE_PWD="$PWD"
+  if [[ -n "$G_REL_BASE" ]]; then
+    __rp_from="$G_REL_BASE"
+  else
+    if [[ -z "$_REL_CACHE_FROM" || "$_REL_CACHE_PWD" != "$PWD" ]]; then
+      _REL_CACHE_FROM=$(pwd -P)
+      _REL_CACHE_PWD="$PWD"
+    fi
+    __rp_from="$_REL_CACHE_FROM"
   fi
-  __rp_from="$_REL_CACHE_FROM"
 
   if [[ "$__rp_target" == "$__rp_from" ]]; then
     printf -v "$__rp_name" '%s' '.'
@@ -481,9 +490,103 @@ WT_LOCAL_MATCHES=()
 WT_REMOTE_MATCHES=()
 WT_REMOTE_TRUNCATED=0
 WT_HAS_ORIGIN=false
+WT_FROM_CONTAINER=false
+WT_CONTAINER_MATCHES=()
 
 _wt_require_repo() {
-  require_repo
+  require_git
+
+  if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    local main rc candidate
+    main=$(_wt_container_main) || rc=$?
+    rc=${rc:-0}
+
+    if [[ "$rc" == "2" ]]; then
+      err 'more than one tree-layout repository is in this directory'
+      for candidate in "${WT_CONTAINER_MATCHES[@]}"; do
+        detail "  $(relpath "$candidate")"
+      done
+      printf '\n' >&2
+      detail 'Run g wt inside the one you want.'
+      printf '\n' >&2
+      return 1
+    fi
+    if [[ "$rc" != "0" ]]; then
+      die 'not inside a git repository'
+    fi
+
+    # Paths are printed relative to where the command was run, then the rest
+    # of the command works from the main checkout, where git expects to be.
+    G_REL_BASE=$(pwd -P)
+    cd "$main" || die "cannot change into ${main}"
+    WT_FROM_CONTAINER=true
+  fi
+
+  _wt_setup_repo
+}
+
+# _wt_container_main — when the current directory holds the checkouts of a
+# tree-layout repository but is not itself a worktree, print that repository's
+# main checkout. Only a main worktree that is a direct child qualifies, so a
+# directory that merely contains repositories is not guessed at, and a flat
+# repository run from its parent keeps failing as it always has.
+_wt_container_main() {
+  local root d parsed main_path branch cfg
+
+  WT_CONTAINER_MATCHES=()
+  root=$(pwd -P)
+
+  for d in */; do
+    d="${d%/}"
+    if [[ ! -d "$d" || ! -e "$d/.git" ]]; then
+      continue
+    fi
+
+    # The main worktree path and its branch come from the first porcelain
+    # block; for a linked worktree that block names the main checkout
+    # elsewhere, which fails the test below.
+    parsed=$(git -C "$d" worktree list --porcelain 2>/dev/null | awk '
+      /^worktree / && !seen { path = substr($0, 10); seen = 1 }
+      /^branch refs\/heads\// && !got { branch = substr($0, 19); got = 1 }
+      END { if (seen) print path "\t" branch }
+    ') || continue
+    if [[ -z "$parsed" ]]; then
+      continue
+    fi
+    main_path="${parsed%%$'\t'*}"
+    branch="${parsed#*$'\t'}"
+    if [[ "$main_path" != "${root}/${d}" ]]; then
+      continue
+    fi
+
+    cfg=$(git -C "$d" config --get g.worktreeLayout 2>/dev/null) || cfg=''
+    case "$cfg" in
+      flat)
+        continue
+        ;;
+      tree)
+        ;;
+      *)
+        if [[ -z "$branch" || "$(basename "$d")" != "$branch" ]]; then
+          continue
+        fi
+        ;;
+    esac
+
+    WT_CONTAINER_MATCHES[${#WT_CONTAINER_MATCHES[@]}]="$main_path"
+  done
+
+  if (( ${#WT_CONTAINER_MATCHES[@]} == 1 )); then
+    printf '%s\n' "${WT_CONTAINER_MATCHES[0]}"
+    return 0
+  fi
+  if (( ${#WT_CONTAINER_MATCHES[@]} > 1 )); then
+    return 2
+  fi
+  return 1
+}
+
+_wt_setup_repo() {
   # git lists the main worktree first, wherever we are running from. New
   # worktrees are created beside it, not beside whichever one contains the
   # current directory, so its path and branch are also what decide the layout.
@@ -669,6 +772,10 @@ _wt_list() {
 
   _wt_scan
   current=$(git rev-parse --show-toplevel 2>/dev/null) || current=''
+  if [[ "$WT_FROM_CONTAINER" == "true" ]]; then
+    # The shell is in the repository directory, not inside any checkout.
+    current=''
+  fi
 
   section "Worktrees"
 
@@ -1328,6 +1435,10 @@ Layout:
   branch. Set g.worktreeLayout to flat or tree to say so explicitly:
 
     git config g.worktreeLayout tree
+
+  In a tree layout the command also works from the directory that holds the
+  checkouts, which is not itself a worktree: it finds the repository there and
+  prints paths relative to wherever it was run.
 
 The worktree path is printed on stdout and everything else on stderr, so
 `cd "$(g wt feature/thing)"` works.

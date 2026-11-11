@@ -622,6 +622,12 @@ git never allows a branch to be a prefix of another: `feature` and `feature/a`
 cannot both exist, so their directories cannot collide. Removing a nested
 worktree also removes the empty branch directories it leaves behind.
 
+`g wt` also works from the repository directory itself, which holds the
+checkouts but is not a worktree. It finds the main checkout there and reports
+paths relative to that directory, so `cd "$(g wt feature/login)"` still lands
+in the right place. A directory that merely contains repositories is not
+searched, so a flat repository run from its parent behaves as before.
+
 A pattern opens the worktree for the matching branch; several matches open a
 picker, and a `SECTION/NAME` pattern that matches nothing offers to create the
 branch.

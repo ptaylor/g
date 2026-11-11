@@ -178,7 +178,9 @@ Rules:
   where the repository directory holds one directory per branch, named exactly
   for it. The main worktree's path and branch decide it, and
   `g.worktreeLayout=flat|tree` overrides; `g clone` creates the tree layout
-  and records the setting. Every path is derived in
+  and records the setting. Running `g wt` from the tree repository directory
+  itself also works: it resolves the main checkout from there, and path output
+  stays relative to that directory. Every path is derived in
   `_wt_path_for_branch`; a new command must go through it rather than joining
   names itself.
 - **No fork per row.** A loop over repository contents must not use command
