@@ -34,6 +34,7 @@ g version
 | `g grep` | `git grep` here, or across every indexed repository |
 | `g log` | The whole history, commit by commit |
 | `g branch-log` | The commits this branch adds, with their changes |
+| `g clone` | Clone into `<repo>/<default-branch>`, ready for worktrees |
 | `g contributors`, `g who` | Who has written this repository, by number of commits |
 | `g repos` | List the repositories g has been run in |
 | `g sync` | Commit, update and push one cached repository |
@@ -552,6 +553,28 @@ aggressively unless asked — the first is irreversible, the second rarely pays
 for itself. Destructive cleanup (`git clean -fdx`, `git worktree remove`) and
 scheduled upkeep (`git maintenance start`) are deliberately left to git.
 
+## `g clone`
+
+Clones a repository into the tree layout `g worktree` uses, so the first
+checkout is already one branch directory among its siblings:
+
+```bash
+g clone https://github.com/user/foo-bar.git        # -> foo-bar/main/
+g clone git@github.com:user/foo-bar.git my-name    # -> my-name/main/
+cd "$(g clone URL)"                                # the path is on stdout
+```
+
+The directory name defaults to the repository name taken from the URL. The
+default branch is read with `git ls-remote --symref` *before* the clone, so
+the checkout lands in a directory named for the branch the remote reports
+rather than a guess at `main`. The clone records `g.worktreeLayout=tree`, so
+the layout stays known even if the container is renamed or the main checkout
+is left detached. Later `g wt feature/x` then creates `foo-bar/feature/x`
+beside `foo-bar/main`.
+
+The destination is refused when it already exists, and the checkout path is
+the only thing written to stdout.
+
 ## `g worktree` (alias `g wt`)
 
 Manages git worktrees by branch name — ported from the `worktree` script in
@@ -582,7 +605,7 @@ already in use:
 | Layout | Where a worktree goes | In use when |
 | --- | --- | --- |
 | flat | `<repo>--<branch>`, with `/` in the branch replaced by `-` | the usual clone: the main worktree's directory is not named for its branch |
-| tree | `<repo>/<branch>`, so `feature/a` sits in `<repo>/feature/a` | the main worktree's directory is named for the branch it has checked out |
+| tree | `<repo>/<branch>`, so `feature/a` sits in `<repo>/feature/a` | the main worktree's directory is named for the branch it has checked out, as `g clone` creates it |
 
 The layout is decided from the main worktree, not from wherever the command is
 run, so it is the same from a linked worktree as from the main checkout. To

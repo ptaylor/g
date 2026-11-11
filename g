@@ -1336,6 +1336,134 @@ EOF
   printf '\n'
 }
 
+# ── g clone ─────────────────────────────────────────────────────────────────
+# New rather than ported: clone into the tree layout, so the first checkout is
+# already at <repo>/<branch> and g worktree builds the rest of the repository
+# around it.
+
+# _clone_repo_name URL — the repository directory name implied by URL, with a
+# trailing slash and .git suffix removed. Handles scp-like URLs, which carry
+# no slash after the host: git@github.com:user/foo-bar.git.
+_clone_repo_name() {
+  local url="$1" name
+
+  url="${url%/}"
+  name="${url##*/}"
+  if [[ "$name" == *:* && "$name" != */* ]]; then
+    name="${url##*:}"
+  fi
+  printf '%s\n' "${name%.git}"
+}
+
+# _clone_default_branch URL — the branch the remote reports as its HEAD. This
+# has to be known before cloning so the checkout lands in a directory named
+# for it; ls-remote --symref is the only way to ask without a checkout.
+_clone_default_branch() {
+  local url="$1" out branch
+
+  if ! out=$(git ls-remote --symref "$url" HEAD 2>&1); then
+    err "cannot read the default branch of '${url}'"
+    printf '\n' >&2
+    printf '%s\n' "$out" | relay
+    printf '\n' >&2
+    return 1
+  fi
+
+  branch=$(printf '%s\n' "$out" | awk '
+    /^ref: refs\/heads\// && !found {
+      sub(/^ref: refs\/heads\//, "")
+      sub(/\t.*/, "")
+      print
+      found = 1
+    }
+  ')
+  if [[ -z "$branch" ]]; then
+    branch='main'
+    warn "the remote does not report a default branch; using 'main'"
+  fi
+  printf '%s\n' "$branch"
+}
+
+clone_usage() {
+  section "g clone — clone into a branch directory"
+
+  cat <<'EOF'
+Usage:
+  g clone URL [NAME]
+
+Clones URL into NAME/DEFAULT-BRANCH/, where DEFAULT-BRANCH is the branch the
+remote reports as its default. NAME defaults to the repository name taken from
+URL. The result is the tree layout g worktree uses: the repository directory
+holds one directory per branch, named exactly for it, so every later worktree
+lands beside the default checkout.
+
+Options:
+  -h, --help   Show this help
+
+The checkout path is printed on stdout and everything else on stderr, so
+`cd "$(g clone URL)"` works.
+EOF
+
+  printf '\n'
+}
+
+cmd_clone() {
+  local url='' name='' branch target
+
+  while (( $# )); do
+    case "$1" in
+      -h|--help)
+        clone_usage
+        return 0
+        ;;
+      -*)
+        die "unknown option: $1"
+        ;;
+      *)
+        if [[ -z "$url" ]]; then
+          url="$1"
+        elif [[ -z "$name" ]]; then
+          name="$1"
+        else
+          die 'usage: g clone URL [NAME]'
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  if [[ -z "$url" ]]; then
+    die 'usage: g clone URL [NAME]'
+  fi
+
+  if [[ -z "$name" ]]; then
+    name=$(_clone_repo_name "$url")
+  fi
+  if [[ -z "$name" || "$name" == '.' || "$name" == '..' || "$name" == -* ]]; then
+    die "cannot derive a repository directory name from '${url}'; pass NAME"
+  fi
+
+  branch=$(_clone_default_branch "$url") || return 1
+  target="${name}/${branch}"
+
+  if [[ -e "$target" ]]; then
+    die "destination already exists: ${target}"
+  fi
+
+  info "cloning into ${target}"
+  git clone "$url" "$target" 2>&1 | relay
+
+  # Record the layout: a checkout whose directory is already named for its
+  # branch needs no guesswork later, even if the container is renamed or the
+  # main worktree is left detached.
+  if ! git -C "$target" config g.worktreeLayout tree 2>/dev/null; then
+    warn 'cloned, but could not record g.worktreeLayout=tree'
+  fi
+
+  printf '\n' >&2
+  printf '%s\n' "$target"
+}
+
 # ── g branches ──────────────────────────────────────────────────────────────
 # Ported from ~/bitbucket/pftylr/utils/git/git-branch-list. The integration
 # branch is looked up in the same order the worktree command uses, so both
@@ -4349,6 +4477,7 @@ Usage:
 Commands:
   help                Show this help
   version             Show the version
+  clone               Clone into a branch directory, ready for worktrees
   branches            List local branches with their state
   branch-summary      Summarise the current branch against its base
   branch-log          The commits this branch adds, with their changes
@@ -4391,6 +4520,9 @@ run_cmd() {
       ;;
     version|--version|-V)
       cmd_version
+      ;;
+    clone)
+      cmd_clone "$@"
       ;;
     worktree|wt)
       cmd_worktree "$@"

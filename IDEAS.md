@@ -70,6 +70,15 @@ cache, a stale entry produces "it has gone from the disk" noise. `--prune` shoul
 drop them, and the same pass could reconcile the duplicate paths recorded before
 `pwd -P` was applied.
 
+### `g repos` names every tree-layout repository `main`
+
+The cache records the checkout a command ran in, and the listing names a
+repository by the basename of that path. With `g clone`'s tree layout that
+basename is the default branch, so every such repository shows as `main` and
+`g sync -n main` matches all of them. Path suffixes still work, and
+`g sync -n foo-bar/main` is unambiguous, but the name should come from the
+container directory when the checkout records `g.worktreeLayout=tree`.
+
 ### Show size and age for untracked files in `g sync`
 
 The report lists names only. `g untracked` already computes both through

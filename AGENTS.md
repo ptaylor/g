@@ -14,7 +14,7 @@ is pleasant on a terminal and clean in a pipe.
 WIP. The dispatch skeleton, the presentation layer, and the commands ported so
 far are in place: `worktree` (alias `wt`), `gc`, `branches`, `branch-summary`,
 `grep`, `log`, `branch-log`, `contributors` (alias `who`) and `untracked`, plus
-`repos` and `sync`, which are new rather than ports.
+`clone`, `repos` and `sync`, which are new rather than ports.
 Further commands are ported one at a time from `~/bitbucket/pftylr/utils/git`
 and must not be assumed to exist until they appear in `g help`.
 
@@ -26,6 +26,7 @@ and must not be assumed to exist until they appear in `g help`.
 
 ./g help                      # usage
 ./g version                   # version
+./g clone URL                 # clone into <repo>/<default-branch>
 ./g wt                        # list worktrees
 ./g wt -s                     # worktree status report
 ./g branches                  # local branches with their state
@@ -176,7 +177,8 @@ Rules:
   use: flat, where worktrees are siblings named `<repo>--<branch>`, or tree,
   where the repository directory holds one directory per branch, named exactly
   for it. The main worktree's path and branch decide it, and
-  `g.worktreeLayout=flat|tree` overrides. Every path is derived in
+  `g.worktreeLayout=flat|tree` overrides; `g clone` creates the tree layout
+  and records the setting. Every path is derived in
   `_wt_path_for_branch`; a new command must go through it rather than joining
   names itself.
 - **No fork per row.** A loop over repository contents must not use command
