@@ -576,10 +576,32 @@ g wt -b feature/login      # fetch from origin, then create
 | `-s, --status` | Report worktrees whose remote branch is gone, or whose branch is merged |
 | `-h, --help` | Show the command's help |
 
-Worktrees are created beside the main checkout as `<repo>--<branch>`, with `/`
-in the branch name replaced by `-`. A pattern opens the worktree for the
-matching branch; several matches open a picker, and a `SECTION/NAME` pattern
-that matches nothing offers to create the branch.
+A repository uses one of two layouts, and every `wt` operation follows the one
+already in use:
+
+| Layout | Where a worktree goes | In use when |
+| --- | --- | --- |
+| flat | `<repo>--<branch>`, with `/` in the branch replaced by `-` | the usual clone: the main worktree's directory is not named for its branch |
+| tree | `<repo>/<branch>`, so `feature/a` sits in `<repo>/feature/a` | the main worktree's directory is named for the branch it has checked out |
+
+The layout is decided from the main worktree, not from wherever the command is
+run, so it is the same from a linked worktree as from the main checkout. To
+settle it explicitly — and to keep a flat repository whose checkout happens to
+be named after its branch flat — set `g.worktreeLayout`:
+
+```bash
+git config g.worktreeLayout flat
+git config g.worktreeLayout tree
+```
+
+In the tree layout the branch name *is* the directory path, which works because
+git never allows a branch to be a prefix of another: `feature` and `feature/a`
+cannot both exist, so their directories cannot collide. Removing a nested
+worktree also removes the empty branch directories it leaves behind.
+
+A pattern opens the worktree for the matching branch; several matches open a
+picker, and a `SECTION/NAME` pattern that matches nothing offers to create the
+branch.
 
 The listing has three columns — `BRANCH`, `PATH` (relative to where you are)
 and `NOTE`:

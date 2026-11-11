@@ -463,9 +463,14 @@ have_tty() {
 
 WT_MODE=''
 WT_FORCE=false
+# flat: worktrees are siblings named <repo>--<branch>.
+# tree: the repository directory holds one directory per branch, named exactly
+# for it, so feature/a sits at <repo>/feature/a.
+WT_LAYOUT='flat'
 WT_REPO_ROOT=''
 WT_REPO_NAME=''
 WT_PARENT_DIR=''
+WT_WORKTREE_BASE=''
 WT_BASE_REFS=()
 WT_PATHS=()
 WT_BRANCHES=()
@@ -479,15 +484,54 @@ WT_HAS_ORIGIN=false
 
 _wt_require_repo() {
   require_repo
-  # New worktrees are created beside the main worktree, not beside whichever
-  # one happens to contain the current directory.
-  WT_REPO_ROOT=$(git worktree list --porcelain | head -1 | sed 's/^worktree //')
+  # git lists the main worktree first, wherever we are running from. New
+  # worktrees are created beside it, not beside whichever one contains the
+  # current directory, so its path and branch are also what decide the layout.
+  _wt_scan
+  WT_REPO_ROOT="${WT_PATHS[0]:-}"
   WT_REPO_NAME=$(basename "$WT_REPO_ROOT")
   WT_PARENT_DIR=$(dirname "$WT_REPO_ROOT")
+  _wt_resolve_layout
+
+  if [[ "$WT_LAYOUT" == "tree" ]]; then
+    WT_WORKTREE_BASE=$(dirname "$WT_REPO_ROOT")
+  else
+    WT_WORKTREE_BASE="${WT_PARENT_DIR}/${WT_REPO_NAME}"
+  fi
 
   WT_HAS_ORIGIN=false
   if git remote | grep -qx origin; then
     WT_HAS_ORIGIN=true
+  fi
+}
+
+# Decide how this repository lays out its worktrees. An explicit
+# g.worktreeLayout wins; otherwise a main worktree whose directory is named
+# for the branch it has checked out is the only signal that branches nest
+# beneath it. A flat repository is unchanged by this rule unless its main
+# checkout happens to be named after its branch, which the setting can fix.
+_wt_resolve_layout() {
+  local cfg main_branch
+
+  cfg=$(git config --get g.worktreeLayout 2>/dev/null) || cfg=''
+  case "$cfg" in
+    flat|tree)
+      WT_LAYOUT="$cfg"
+      return 0
+      ;;
+    '')
+      ;;
+    *)
+      warn "ignoring g.worktreeLayout='${cfg}' (expected flat or tree)"
+      ;;
+  esac
+
+  main_branch="${WT_BRANCHES[0]:-(detached)}"
+  if [[ "$main_branch" != '(detached)' &&
+    "$(basename "$WT_REPO_ROOT")" == "$main_branch" ]]; then
+    WT_LAYOUT='tree'
+  else
+    WT_LAYOUT='flat'
   fi
 }
 
@@ -504,7 +548,46 @@ _wt_branch_exists() {
 }
 
 _wt_path_for_branch() {
-  printf '%s\n' "${WT_PARENT_DIR}/${WT_REPO_NAME}--${1//\//-}"
+  if [[ "$WT_LAYOUT" == "tree" ]]; then
+    printf '%s/%s\n' "$WT_WORKTREE_BASE" "$1"
+  else
+    printf '%s--%s\n' "$WT_WORKTREE_BASE" "${1//\//-}"
+  fi
+}
+
+# _wt_busy_ancestor PATH — print the first directory between the repository
+# directory and PATH that already exists and holds anything. git will happily
+# create a nested worktree inside a directory full of someone else's files;
+# in a tree layout any such directory is a mistake. Empty leftovers from a
+# removal are fine and are reused.
+_wt_busy_ancestor() {
+  local dir="$WT_WORKTREE_BASE" rest="${1#"$WT_WORKTREE_BASE"/}" part
+
+  while [[ "$rest" == */* ]]; do
+    part="${rest%%/*}"
+    rest="${rest#*/}"
+    dir="$dir/$part"
+    if [[ -d "$dir" && -n "$(ls -A "$dir" 2>/dev/null)" ]]; then
+      printf '%s\n' "$dir"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Drop the empty branch directories a nested worktree leaves behind. git
+# removes the leaf only, and an empty <branch> directory would otherwise sit
+# where a later one-segment branch needs to go.
+_wt_prune_empty_parents() {
+  local dir
+
+  dir=$(dirname "$1")
+  while [[ "$dir" == "$WT_WORKTREE_BASE"/* && -d "$dir" ]]; do
+    if ! rmdir "$dir" 2>/dev/null; then
+      break
+    fi
+    dir=$(dirname "$dir")
+  done
 }
 
 _wt_existing_for_branch() {
@@ -962,12 +1045,19 @@ _wt_select() {
 }
 
 _wt_create() {
-  local branch="$1" is_new="${2:-false}" wpath base
+  local branch="$1" is_new="${2:-false}" wpath base busy
 
   wpath=$(_wt_path_for_branch "$branch")
 
   if [[ -d "$wpath" ]]; then
     die "directory already exists: $(relpath "$wpath")"
+  fi
+
+  if [[ "$WT_LAYOUT" == "tree" ]]; then
+    busy=$(_wt_busy_ancestor "$wpath") || busy=''
+    if [[ -n "$busy" ]]; then
+      die "cannot create the worktree for '${branch}': $(relpath "$busy") is not empty"
+    fi
   fi
 
   if [[ "$is_new" == "true" ]]; then
@@ -1123,6 +1213,9 @@ _wt_remove() {
     if [[ -n "$out" ]]; then
       printf '%s\n' "$out" | relay
     fi
+    if [[ "$WT_LAYOUT" == "tree" ]]; then
+      _wt_prune_empty_parents "$wt_path"
+    fi
     printf '\n' >&2
     return 0
   fi
@@ -1221,6 +1314,20 @@ Options:
                            whose branch is merged — including squash merges —
                            into develop/dev/main/master
   -h, --help               Show this help
+
+Layout:
+  A repository uses one of two layouts, and every worktree command follows
+  the one already in use:
+
+    flat   Worktrees are siblings named <repo>--<branch>, with / in the branch
+           replaced by -. This is what a normal clone gets.
+    tree   The repository directory holds one directory per branch, named
+           exactly for it, so feature/a sits at <repo>/feature/a.
+
+  The layout is read from a main worktree whose directory is named for its
+  branch. Set g.worktreeLayout to flat or tree to say so explicitly:
+
+    git config g.worktreeLayout tree
 
 The worktree path is printed on stdout and everything else on stderr, so
 `cd "$(g wt feature/thing)"` works.

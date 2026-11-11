@@ -172,6 +172,13 @@ Rules:
   When a failure is reported under a message the command already printed, raise
   `G_INDENT` for the block so the whole explanation — including its `error:`
   line — sits one level in, and restore it afterwards.
+- **Worktrees come in two layouts.** `g worktree` follows the layout already in
+  use: flat, where worktrees are siblings named `<repo>--<branch>`, or tree,
+  where the repository directory holds one directory per branch, named exactly
+  for it. The main worktree's path and branch decide it, and
+  `g.worktreeLayout=flat|tree` overrides. Every path is derived in
+  `_wt_path_for_branch`; a new command must go through it rather than joining
+  names itself.
 - **No fork per row.** A loop over repository contents must not use command
   substitution or `read` on a herestring per item — both cost a process or a
   temporary file each. Assign with the `*_into` helpers (`relpath_into`,
