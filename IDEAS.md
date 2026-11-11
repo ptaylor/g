@@ -85,6 +85,13 @@ The report lists names only. `g untracked` already computes both through
 `_ut_human_bytes`, and `notes.txt  1.2K  3 days` says at a glance whether it is
 the scratch file you expected.
 
+### Line counts per file in `g status -v`
+
+The report gives `--shortstat` totals for the staged and the unstaged changes.
+Per-file `+12 -3` needs `--numstat` joined to the status records by path, and
+without associative arrays that join is either a sorted merge or quadratic. The
+totals were enough to ship; this is for when they are not.
+
 ### Warn when syncing on the base branch
 
 `g sync` will commit straight onto `main`. Everything else in the tool asks
@@ -92,13 +99,6 @@ first, so a note — "you are on main; commit anyway?" — would fit, with `-y` 
 force it.
 
 ## Commands
-
-### `g status`
-
-The command typed most often has no `g` equivalent. One screen: staged, unstaged
-and untracked grouped and counted, a diffstat, ahead and behind against the base,
-and the worktree it is happening in. `git status` is a wall of hints; this would
-be the report.
 
 ### `g pick PATTERN`
 
