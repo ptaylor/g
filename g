@@ -1563,13 +1563,15 @@ cmd_untracked() {
   # Each entry is flag|date|epoch|bytes|path: the flag records whether git
   # ignores the file, and stat supplies the rest in one call per batch.
   # A file that vanishes mid-listing makes stat fail, hence the || true.
+  # The -- matters: without it a file named -x is read as an option, stat
+  # rejects the whole call, and every file in that batch goes missing.
   listing=$(
     {
       ( cd "$root" && git ls-files -z --others --exclude-standard |
-        xargs -0 stat "${UT_STAT[@]}" 2>/dev/null ) | sed 's/^/u|/'
+        xargs -0 stat "${UT_STAT[@]}" -- 2>/dev/null ) | sed 's/^/u|/'
       if [[ "$UT_INCLUDE_IGNORED" == "true" ]]; then
         ( cd "$root" && git ls-files -z --others --ignored --exclude-standard |
-          xargs -0 stat "${UT_STAT[@]}" 2>/dev/null ) | sed 's/^/i|/'
+          xargs -0 stat "${UT_STAT[@]}" -- 2>/dev/null ) | sed 's/^/i|/'
       fi
     } | sort -s -t'|' -k3,3 -nr
   ) || true
